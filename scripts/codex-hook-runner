@@ -208,6 +208,10 @@ if ! has_cmd jq; then
   die "jq is required for hook parsing (install jq)"
 fi
 
+if ! has_cmd codex; then
+  die "codex CLI not found in PATH"
+fi
+
 CODEX_ARGS=("$@")
 if [[ "${CODEX_ARGS[0]}" == "codex" ]]; then
   CODEX_ARGS=("${CODEX_ARGS[@]:1}")
@@ -525,7 +529,11 @@ extract_tool_result_raw() {
     empty' 2>/dev/null
 }
 
+CODEX_PROC=()
 coproc CODEX_PROC { codex "${EXEC_ARGS[@]}"; }
+if [[ -z "${CODEX_PROC[0]-}" ]]; then
+  die "Failed to start codex process"
+fi
 CODEX_PID=$!
 
 while IFS= read -r line <&"${CODEX_PROC[0]}"; do
