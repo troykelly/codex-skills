@@ -25,8 +25,9 @@
 #   CODEX_ACCOUNT_COOLDOWN_MINUTES   Cooldown after account exhaustion (default: 5)
 #   CODEX_DISABLE_HOOKS             Disable hook runner integration (default: false)
 #   CODEX_NEW_PROMPT                 Initial prompt for --new (skips interactive prompt)
-#   CODEX_AUTONOMOUS_INTERACTIVE     Prompt for user replies when Codex asks (default: true)
-#   CODEX_AUTONOMOUS_ALWAYS_PROMPT   Always prompt for a reply after each turn (default: false)
+#   CODEX_AUTONOMOUS_INTERACTIVE     Prompt for user replies when Codex requests input (default: true)
+#   CODEX_AUTONOMOUS_CONTINUE_PROMPT Default message when continuing without a user reply (default: "Continue autonomously.")
+#   CODEX_AUTONOMOUS_SCHEMA_FILE     JSON schema file for structured agent responses
 #   CODEX_HOOK_RUNNER               Path to codex-hook-runner (default: scripts/codex-hook-runner or PATH)
 #   CODEX_HOOK_ROOT                  Hook root directory (default: $CODEX_HOME/hooks)
 #   CODEX_HOOK_CONFIG                Path to hooks.json (default: $CODEX_HOOK_ROOT/hooks.json)
@@ -56,8 +57,15 @@ WORKTREE_ROOT="/tmp/codex-worktrees"
 MAX_CRASHES="${MAX_CRASHES:-10}"
 MAX_ACCOUNT_SWITCHES="${CODEX_AUTONOMOUS_MAX_SWITCHES:-10}"
 HOOKS_ACTIVE=false
+RESPONSE_SCHEMA_FILE=""
+RUN_TRANSCRIPT=""
+RUN_LAST_MESSAGE_FILE=""
+LAST_ACTION=""
+LAST_MESSAGE=""
+LAST_QUESTION=""
 
 DEFAULT_CODEX_FLAGS="${CODEX_AUTONOMOUS_FLAGS:-}"
+RESPONSE_REMINDER="Respond only in JSON with action (continue|needs_user|complete), message, question (question can be empty)."
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 
@@ -95,32 +103,21 @@ hooks_enabled() {
   return 0
 }
 
-needs_user_reply() {
-  local msg="${1:-}"
-  local always="${CODEX_AUTONOMOUS_ALWAYS_PROMPT:-false}"
-
-  if [[ "$always" == "true" || "$always" == "1" ]]; then
-    return 0
-  fi
-
-  [[ -n "$msg" ]] || return 1
-
-  if echo "$msg" | grep -q '?'; then
-    return 0
-  fi
-
-  echo "$msg" | grep -Eqi '(^|[[:space:]])(please|confirm|provide|share|choose|tell me|let me know|which|what|where|when|how|do you want|should i|any specific|can you)' && return 0
-
-  return 1
-}
-
 prompt_for_reply() {
+  local prompt_question="${1:-}"
   local reply=""
 
   if [[ -t 0 ]]; then
-    echo -e "${GREEN}Codex is waiting for your response.${NC}"
-    echo "Enter your response. End with an empty line:"
+    if [[ -n "$prompt_question" ]]; then
+      echo -e "${YELLOW}Codex needs input:${NC} ${prompt_question}"
+    fi
+    echo -e "${GREEN}Enter a reply, or press Enter to let Codex continue autonomously.${NC}"
+    echo "Type :q to exit."
     while IFS= read -r line; do
+      if [[ "$line" == ":q" || "$line" == ":quit" ]]; then
+        printf '%s' "__CODEX_AUTONOMOUS_QUIT__"
+        return 0
+      fi
       [[ -z "$line" ]] && break
       if [[ -n "$reply" ]]; then
         reply="${reply}"$'\n'"${line}"
@@ -164,6 +161,131 @@ read_new_prompt() {
     fi
     log_warn "No instructions entered. Please describe the task."
   done
+}
+
+response_schema_content() {
+  cat <<'JSON'
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "title": "CodexAutonomousResponse",
+  "type": "object",
+  "required": ["action", "message", "question"],
+  "properties": {
+    "action": { "type": "string", "enum": ["continue", "needs_user", "complete"] },
+    "message": { "type": "string" },
+    "question": { "type": "string" }
+  },
+  "additionalProperties": false
+}
+JSON
+}
+
+ensure_response_schema_file() {
+  local schema_path="${CODEX_AUTONOMOUS_SCHEMA_FILE:-}"
+  if [[ -z "$schema_path" ]]; then
+    schema_path="${CODEX_HOME}/schemas/codex-autonomous-response.schema.json"
+  fi
+
+  mkdir -p "$(dirname "$schema_path")" 2>/dev/null || true
+  local tmp="${schema_path}.tmp.$$"
+  response_schema_content > "$tmp"
+  if [[ -f "$schema_path" ]] && cmp -s "$tmp" "$schema_path"; then
+    rm -f "$tmp"
+  else
+    mv "$tmp" "$schema_path"
+  fi
+
+  RESPONSE_SCHEMA_FILE="$schema_path"
+}
+
+last_agent_message_from_transcript() {
+  local transcript="$1"
+  [[ -f "$transcript" ]] || return 1
+  jq -r 'select(.type=="item.completed" and .item.type=="agent_message") | .item.text' "$transcript" | tail -n 1
+}
+
+normalize_response_json() {
+  local raw="$1"
+  [[ -n "$raw" ]] || return 1
+
+  if echo "$raw" | jq -e 'type=="object"' >/dev/null 2>&1; then
+    echo "$raw"
+    return 0
+  fi
+
+  if echo "$raw" | jq -e 'type=="string"' >/dev/null 2>&1; then
+    local parsed
+    parsed=$(echo "$raw" | jq -r 'fromjson? // empty')
+    if [[ -n "$parsed" ]] && echo "$parsed" | jq -e 'type=="object"' >/dev/null 2>&1; then
+      echo "$parsed"
+      return 0
+    fi
+  fi
+
+  return 1
+}
+
+get_last_response_json() {
+  local raw=""
+  if [[ -n "$RUN_LAST_MESSAGE_FILE" && -s "$RUN_LAST_MESSAGE_FILE" ]]; then
+    raw=$(cat "$RUN_LAST_MESSAGE_FILE")
+    rm -f "$RUN_LAST_MESSAGE_FILE" 2>/dev/null || true
+    RUN_LAST_MESSAGE_FILE=""
+  fi
+
+  if [[ -z "$raw" && -n "$RUN_TRANSCRIPT" ]]; then
+    raw=$(last_agent_message_from_transcript "$RUN_TRANSCRIPT" 2>/dev/null || true)
+  fi
+
+  [[ -n "$raw" ]] || return 1
+  normalize_response_json "$raw"
+}
+
+parse_response_action() {
+  local json="$1"
+  LAST_ACTION=$(echo "$json" | jq -r '.action // empty')
+  LAST_ACTION=$(echo "$LAST_ACTION" | tr '[:upper:]' '[:lower:]')
+  LAST_MESSAGE=$(echo "$json" | jq -r '.message // empty')
+  LAST_QUESTION=$(echo "$json" | jq -r '.question // empty')
+
+  if [[ -z "$LAST_MESSAGE" ]]; then
+    LAST_MESSAGE="$LAST_QUESTION"
+  fi
+
+  case "$LAST_ACTION" in
+    ask|question|needs_input|need_input) LAST_ACTION="needs_user" ;;
+    ack|acknowledge|continue|next|proceed) LAST_ACTION="continue" ;;
+    done|completed|finished) LAST_ACTION="complete" ;;
+  esac
+
+  if [[ -z "$LAST_MESSAGE" ]]; then
+    return 1
+  fi
+
+  if [[ "$LAST_ACTION" == "needs_user" && -z "$LAST_QUESTION" ]]; then
+    return 1
+  fi
+
+  case "$LAST_ACTION" in
+    continue|needs_user|complete) return 0 ;;
+  esac
+  return 1
+}
+
+wrap_resume_prompt() {
+  local base="${1:-}"
+
+  if [[ -n "$base" && "$base" == *"$RESPONSE_REMINDER"* ]]; then
+    printf '%s' "$base"
+    return 0
+  fi
+
+  if [[ -z "$base" ]]; then
+    printf '%s' "$RESPONSE_REMINDER"
+    return 0
+  fi
+
+  printf '%s\n\n%s' "$base" "$RESPONSE_REMINDER"
 }
 
 resolve_hook_runner() {
@@ -407,6 +529,10 @@ run_codex_session() {
   local codex_session_id="${4:-}"
   local before_lines="$5"
 
+  if [[ "$mode" == "resume" ]]; then
+    prompt=$(wrap_resume_prompt "$prompt")
+  fi
+
   local -a flags=()
   # shellcheck disable=SC2206
   flags=(${DEFAULT_CODEX_FLAGS})
@@ -421,21 +547,44 @@ run_codex_session() {
   if [[ "$has_dangerous" == "false" ]]; then
     flags+=("--dangerously-bypass-approvals-and-sandbox")
   fi
-  local last_message_file=""
-  if [[ -n "${CODEX_HOME:-}" ]]; then
-    mkdir -p "${CODEX_HOME}/logs" 2>/dev/null || true
-    last_message_file=$(mktemp "${CODEX_HOME}/logs/last-message.${CODEX_AUTONOMOUS_SESSION_ID:-session}.XXXXXX")
-  else
-    last_message_file=$(mktemp)
-  fi
-  flags+=("--output-last-message" "$last_message_file")
 
+  if [[ "$mode" == "new" ]]; then
+    local has_output_schema=false
+    local has_output_last_message=false
+    for flag in "${flags[@]}"; do
+      case "$flag" in
+        --output-schema)
+          has_output_schema=true
+          ;;
+        --output-last-message|-o)
+          has_output_last_message=true
+          ;;
+      esac
+    done
+
+    if [[ "$has_output_schema" == "false" ]]; then
+      ensure_response_schema_file
+      response_schema="$RESPONSE_SCHEMA_FILE"
+      if [[ -n "$response_schema" ]]; then
+        flags+=("--output-schema" "$response_schema")
+      fi
+    fi
+
+    if [[ "$has_output_last_message" == "false" ]]; then
+      local lm_dir="${CODEX_HOME}/logs"
+      mkdir -p "$lm_dir" 2>/dev/null || true
+      last_message_file=$(mktemp "${lm_dir}/autonomous-last-message.${CODEX_AUTONOMOUS_SESSION_ID:-session}.XXXXXX.json")
+      flags+=("--output-last-message" "$last_message_file")
+    fi
+  fi
   local exit_code=0
   local use_hooks=false
   local hook_runner=""
   local hook_transcript=""
   local hook_root=""
   local hook_config=""
+  local response_schema=""
+  local last_message_file=""
   HOOKS_ACTIVE=false
 
   hook_runner=$(resolve_hook_runner)
@@ -458,6 +607,18 @@ run_codex_session() {
       else
         log_warn "hooks.json not found at ${hook_config}; running without hooks"
         export CODEX_HOOKS=0
+        hook_transcript="${CODEX_HOOK_TRANSCRIPT:-${CODEX_HOME}/logs/hook-${CODEX_AUTONOMOUS_SESSION_ID:-session}.jsonl}"
+        mkdir -p "$(dirname "$hook_transcript")" 2>/dev/null || true
+        hook_config="$(mktemp "${CODEX_HOME}/hooks.empty.XXXXXX")"
+        printf '%s\n' '{"hooks":{}}' > "$hook_config"
+        use_hooks=true
+        HOOKS_ACTIVE=false
+        export CODEX_HOOK_ROOT="$hook_root"
+        export CODEX_HOOK_CONFIG="$hook_config"
+        export CODEX_PROJECT_ROOT="$worktree_dir"
+        CODEX_HOOK_BLOCK_FILE="$(hook_block_file_for_session "${CODEX_AUTONOMOUS_SESSION_ID:-session}")"
+        export CODEX_HOOK_BLOCK_FILE
+        rm -f "$CODEX_HOOK_BLOCK_FILE" 2>/dev/null || true
       fi
     else
       log_warn "Hooks enabled but codex-hook-runner not found; running without hooks"
@@ -498,10 +659,6 @@ run_codex_session() {
   fi
 
   RUN_DISCOVERED=""
-  RUN_LAST_MESSAGE_TEXT=""
-  if [[ -f "$last_message_file" ]]; then
-    RUN_LAST_MESSAGE_TEXT=$(cat "$last_message_file" 2>/dev/null || true)
-  fi
   if [[ -z "$codex_session_id" ]]; then
     RUN_DISCOVERED=$(discover_new_session_id "$before_lines" || true)
   fi
@@ -511,6 +668,8 @@ run_codex_session() {
   if [[ -n "${hook_config:-}" && -f "$hook_config" && "$hook_config" == *"/hooks.empty."* ]]; then
     rm -f "$hook_config" 2>/dev/null || true
   fi
+  RUN_TRANSCRIPT="$hook_transcript"
+  RUN_LAST_MESSAGE_FILE="$last_message_file"
   RUN_EXIT_CODE="$exit_code"
 }
 
@@ -638,8 +797,49 @@ if [[ "$CONTINUE_MODE" == "true" || -n "$RESUME_ID" ]]; then
     EXIT_CODE="${result%%|*}"
 
     if [[ "$EXIT_CODE" -eq 0 ]]; then
-      log_ok "Session completed successfully"
-      exit 0
+      if response_json=$(get_last_response_json); then
+        if parse_response_action "$response_json"; then
+          case "$LAST_ACTION" in
+            complete)
+              log_ok "Session completed successfully"
+              exit 0
+              ;;
+            continue)
+              MSG="${CODEX_AUTONOMOUS_CONTINUE_PROMPT:-Continue autonomously.}"
+              continue
+              ;;
+            needs_user)
+              if [[ "${CODEX_AUTONOMOUS_INTERACTIVE:-true}" == "false" ]]; then
+                log_warn "Codex requested input; continuing autonomously (CODEX_AUTONOMOUS_INTERACTIVE=false)."
+                MSG="${CODEX_AUTONOMOUS_CONTINUE_PROMPT:-Continue autonomously.}"
+                continue
+              fi
+              MSG=$(prompt_for_reply "$LAST_QUESTION")
+              if [[ "$MSG" == "__CODEX_AUTONOMOUS_QUIT__" ]]; then
+                exit 0
+              fi
+              if [[ -z "$MSG" ]]; then
+                MSG="${CODEX_AUTONOMOUS_CONTINUE_PROMPT:-Continue autonomously.}"
+              fi
+              continue
+              ;;
+          esac
+        fi
+      fi
+
+      log_warn "Codex response missing structured action; prompting for input."
+      if [[ "${CODEX_AUTONOMOUS_INTERACTIVE:-true}" == "false" ]]; then
+        MSG="${CODEX_AUTONOMOUS_CONTINUE_PROMPT:-Continue autonomously.}"
+        continue
+      fi
+      MSG=$(prompt_for_reply)
+      if [[ "$MSG" == "__CODEX_AUTONOMOUS_QUIT__" ]]; then
+        exit 0
+      fi
+      if [[ -z "$MSG" ]]; then
+        MSG="${CODEX_AUTONOMOUS_CONTINUE_PROMPT:-Continue autonomously.}"
+      fi
+      continue
     fi
 
     if [[ "${HOOKS_ACTIVE}" == "true" && "$EXIT_CODE" -eq 2 ]]; then
@@ -761,6 +961,19 @@ if [[ "$NEW_MODE" == "true" ]]; then
   fi
 fi
 
+RESPONSE_CONTRACT=$(cat <<'EOF'
+RESPONSE CONTRACT (MANDATORY):
+Return a single JSON object with:
+- action: "continue" | "needs_user" | "complete"
+- message: user-facing status or answer
+- question: include always (empty string when not needed)
+
+Rules:
+- Do not ask questions that can be answered by reading the repo or docs. Search first.
+- Do not include markdown fences or extra text outside the JSON object.
+EOF
+)
+
 if [[ "$NEW_MODE" == "true" ]]; then
   INITIAL_PROMPT="You are working in an isolated git worktree at: ${WORKTREE_DIR}
 
@@ -772,7 +985,9 @@ ENVIRONMENT:
 - Run tests/builds locally before PRs
 
 USER REQUEST:
-${USER_PROMPT}"
+${USER_PROMPT}
+
+${RESPONSE_CONTRACT}"
 else
   if [[ -n "$EPIC" ]]; then
     EPIC_INSTRUCTION="Focus exclusively on Epic #${EPIC} and its child issues. Do not work on unrelated issues."
@@ -789,7 +1004,9 @@ IMPORTANT:
 - Open PRs when work is complete (do not merge directly to ${DEFAULT_BRANCH})
 - Verify locally (tests/build) before creating PRs
 
-${EPIC_INSTRUCTION}"
+${EPIC_INSTRUCTION}
+
+${RESPONSE_CONTRACT}"
 fi
 
 cleanup() {
@@ -843,21 +1060,66 @@ while true; do
   fi
 
   if [[ "$EXIT_CODE" -eq 0 ]]; then
-    if [[ "${CODEX_AUTONOMOUS_INTERACTIVE:-true}" != "false" ]]; then
-      if needs_user_reply "${RUN_LAST_MESSAGE_TEXT:-}"; then
-        if [[ -z "$CODEX_SESSION_ID" ]]; then
-          log_warn "Codex asked for input but no session id was recorded; ending session."
-          cleanup 1
-          exit 1
-        fi
-        MSG=$(prompt_for_reply)
-        if [[ -n "$MSG" ]]; then
-          continue
-        fi
+    if response_json=$(get_last_response_json); then
+      if parse_response_action "$response_json"; then
+        case "$LAST_ACTION" in
+          complete)
+            cleanup 0
+            exit 0
+            ;;
+          continue)
+            if [[ -z "$CODEX_SESSION_ID" ]]; then
+              log_warn "Codex finished but no session id was recorded; ending session."
+              cleanup 1
+              exit 1
+            fi
+            MSG="${CODEX_AUTONOMOUS_CONTINUE_PROMPT:-Continue autonomously.}"
+            continue
+            ;;
+          needs_user)
+            if [[ -z "$CODEX_SESSION_ID" ]]; then
+              log_warn "Codex finished but no session id was recorded; ending session."
+              cleanup 1
+              exit 1
+            fi
+            if [[ "${CODEX_AUTONOMOUS_INTERACTIVE:-true}" == "false" ]]; then
+              log_warn "Codex requested input; continuing autonomously (CODEX_AUTONOMOUS_INTERACTIVE=false)."
+              MSG="${CODEX_AUTONOMOUS_CONTINUE_PROMPT:-Continue autonomously.}"
+              continue
+            fi
+            MSG=$(prompt_for_reply "$LAST_QUESTION")
+            if [[ "$MSG" == "__CODEX_AUTONOMOUS_QUIT__" ]]; then
+              cleanup 0
+              exit 0
+            fi
+            if [[ -z "$MSG" ]]; then
+              MSG="${CODEX_AUTONOMOUS_CONTINUE_PROMPT:-Continue autonomously.}"
+            fi
+            continue
+            ;;
+        esac
       fi
     fi
-    cleanup 0
-    exit 0
+
+    log_warn "Codex response missing structured action; prompting for input."
+    if [[ -z "$CODEX_SESSION_ID" ]]; then
+      log_warn "Codex finished but no session id was recorded; ending session."
+      cleanup 1
+      exit 1
+    fi
+    if [[ "${CODEX_AUTONOMOUS_INTERACTIVE:-true}" == "false" ]]; then
+      MSG="${CODEX_AUTONOMOUS_CONTINUE_PROMPT:-Continue autonomously.}"
+      continue
+    fi
+    MSG=$(prompt_for_reply)
+    if [[ "$MSG" == "__CODEX_AUTONOMOUS_QUIT__" ]]; then
+      cleanup 0
+      exit 0
+    fi
+    if [[ -z "$MSG" ]]; then
+      MSG="${CODEX_AUTONOMOUS_CONTINUE_PROMPT:-Continue autonomously.}"
+    fi
+    continue
   fi
 
   if [[ "${HOOKS_ACTIVE}" == "true" && "$EXIT_CODE" -eq 2 ]]; then

@@ -54,9 +54,11 @@ codex-autonomous --new
 Notes:
 - `--new` prompts for instructions before starting Codex.
 - Set `CODEX_NEW_PROMPT` to skip the interactive prompt (useful for scripts).
-- If Codex asks a question, `codex-autonomous` will prompt for a reply and resume automatically.
-- Disable that behavior with `CODEX_AUTONOMOUS_INTERACTIVE=false`.
-- Force a prompt every turn with `CODEX_AUTONOMOUS_ALWAYS_PROMPT=true` (useful for scripted runs).
+- Codex replies use a structured response contract (`action`, `message`, `question`) so `codex-autonomous` knows when user input is required.
+- When `action=needs_user`, `codex-autonomous` prompts for a reply and resumes automatically.
+- Disable prompting with `CODEX_AUTONOMOUS_INTERACTIVE=false` (it will auto-continue instead).
+- Customize the auto-continue message with `CODEX_AUTONOMOUS_CONTINUE_PROMPT`.
+- Override the response schema path with `CODEX_AUTONOMOUS_SCHEMA_FILE`.
 
 ### Skills
 

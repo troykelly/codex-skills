@@ -237,6 +237,41 @@ format_tool_label() {
   fi
 }
 
+render_agent_message() {
+  local text="$1"
+  [[ -n "$text" ]] || return 0
+
+  if echo "$text" | jq -e . >/dev/null 2>&1; then
+    local action message question
+    action=$(echo "$text" | jq -r '.action // empty' 2>/dev/null || true)
+    action=$(printf '%s' "$action" | tr '[:upper:]' '[:lower:]')
+    message=$(echo "$text" | jq -r '.message // empty' 2>/dev/null || true)
+    question=$(echo "$text" | jq -r '.question // empty' 2>/dev/null || true)
+
+    case "$action" in
+      ask|question|needs_input|need_input) action="needs_user" ;;
+      ack|acknowledge|next|proceed|continue) action="continue" ;;
+      done|completed|finished) action="complete" ;;
+    esac
+
+    if [[ -n "$message" ]]; then
+      echo -e "${GREEN}[AGENT]${NC} ${message}"
+    elif [[ -n "$question" ]]; then
+      echo -e "${GREEN}[AGENT]${NC} ${question}"
+    else
+      echo -e "${GREEN}[AGENT]${NC} ${text}"
+      return 0
+    fi
+
+    if [[ "$action" == "needs_user" && -n "$question" && "$question" != "$message" ]]; then
+      echo -e "${YELLOW}[QUESTION]${NC} ${question}"
+    fi
+    return 0
+  fi
+
+  echo -e "${GREEN}[AGENT]${NC} ${text}"
+}
+
 emit_pretty() {
   local line="$1"
   local event_type item_type
@@ -309,9 +344,7 @@ emit_pretty() {
         agent_message)
           local text
           text=$(echo "$line" | jq -r '.item.text // empty' 2>/dev/null || true)
-          if [[ -n "$text" ]]; then
-            echo -e "${GREEN}[AGENT]${NC} ${text}"
-          fi
+          render_agent_message "$text"
           ;;
         reasoning)
           if [[ "$SHOW_REASONING" == "true" ]]; then
