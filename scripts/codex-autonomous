@@ -349,18 +349,23 @@ run_codex_session() {
     export CODEX_HOOKS=1
     hook_runner=$(resolve_hook_runner)
     if [[ -n "$hook_runner" ]]; then
-      use_hooks=true
-      HOOKS_ACTIVE=true
       hook_root="${CODEX_HOOK_ROOT:-${CODEX_HOME}/hooks}"
       hook_config="${CODEX_HOOK_CONFIG:-${hook_root}/hooks.json}"
-      hook_transcript="${CODEX_HOOK_TRANSCRIPT:-${CODEX_HOME}/logs/hook-${CODEX_AUTONOMOUS_SESSION_ID:-session}.jsonl}"
-      mkdir -p "$(dirname "$hook_transcript")" 2>/dev/null || true
-      export CODEX_HOOK_ROOT="$hook_root"
-      export CODEX_HOOK_CONFIG="$hook_config"
-      export CODEX_PROJECT_ROOT="$worktree_dir"
-      CODEX_HOOK_BLOCK_FILE="$(hook_block_file_for_session "${CODEX_AUTONOMOUS_SESSION_ID:-session}")"
-      export CODEX_HOOK_BLOCK_FILE
-      rm -f "$CODEX_HOOK_BLOCK_FILE" 2>/dev/null || true
+      if [[ -f "$hook_config" ]]; then
+        use_hooks=true
+        HOOKS_ACTIVE=true
+        hook_transcript="${CODEX_HOOK_TRANSCRIPT:-${CODEX_HOME}/logs/hook-${CODEX_AUTONOMOUS_SESSION_ID:-session}.jsonl}"
+        mkdir -p "$(dirname "$hook_transcript")" 2>/dev/null || true
+        export CODEX_HOOK_ROOT="$hook_root"
+        export CODEX_HOOK_CONFIG="$hook_config"
+        export CODEX_PROJECT_ROOT="$worktree_dir"
+        CODEX_HOOK_BLOCK_FILE="$(hook_block_file_for_session "${CODEX_AUTONOMOUS_SESSION_ID:-session}")"
+        export CODEX_HOOK_BLOCK_FILE
+        rm -f "$CODEX_HOOK_BLOCK_FILE" 2>/dev/null || true
+      else
+        log_warn "hooks.json not found at ${hook_config}; running without hooks"
+        export CODEX_HOOKS=0
+      fi
     else
       log_warn "Hooks enabled but codex-hook-runner not found; running without hooks"
     fi

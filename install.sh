@@ -42,6 +42,9 @@ SKIP_PLAYWRIGHT="${SKIP_PLAYWRIGHT:-false}"
 REPO_URL="https://github.com/troykelly/codex-skills"
 RAW_URL="https://raw.githubusercontent.com/troykelly/codex-skills/main"
 
+TMP_REPO_PARENT=""
+TMP_REPO_DIR=""
+
 # Logging
 log_info() { echo -e "${BLUE}[INFO]${NC} $1"; }
 log_success() { echo -e "${GREEN}[OK]${NC} $1"; }
@@ -49,6 +52,45 @@ log_warn() { echo -e "${YELLOW}[WARN]${NC} $1"; }
 log_error() { echo -e "${RED}[ERROR]${NC} $1"; }
 
 has_cmd() { command -v "$1" &>/dev/null; }
+
+cleanup_tmp_repo() {
+  if [[ -n "$TMP_REPO_PARENT" && -d "$TMP_REPO_PARENT" ]]; then
+    rm -rf "$TMP_REPO_PARENT"
+  fi
+}
+
+fetch_repo_archive() {
+  if [[ -n "$TMP_REPO_DIR" && -d "$TMP_REPO_DIR" ]]; then
+    echo "$TMP_REPO_DIR"
+    return 0
+  fi
+
+  if ! has_cmd tar; then
+    log_warn "tar not found; cannot download repository archive"
+    return 1
+  fi
+
+  TMP_REPO_PARENT=$(mktemp -d)
+  if ! curl -fsSL "${REPO_URL}/archive/refs/heads/main.tar.gz" | tar -xz -C "$TMP_REPO_PARENT"; then
+    log_warn "Failed to download repository archive"
+    rm -rf "$TMP_REPO_PARENT"
+    TMP_REPO_PARENT=""
+    return 1
+  fi
+
+  TMP_REPO_DIR=$(ls -d "${TMP_REPO_PARENT}"/codex-skills-* 2>/dev/null | head -n 1)
+  if [[ -z "$TMP_REPO_DIR" || ! -d "$TMP_REPO_DIR" ]]; then
+    log_warn "Repository archive missing expected contents"
+    rm -rf "$TMP_REPO_PARENT"
+    TMP_REPO_PARENT=""
+    TMP_REPO_DIR=""
+    return 1
+  fi
+
+  echo "$TMP_REPO_DIR"
+}
+
+trap cleanup_tmp_repo EXIT
 
 # Detect OS and package manager
 detect_os() {
@@ -453,13 +495,23 @@ install_scripts() {
 install_skills() {
   local codex_home="${CODEX_HOME:-${HOME}/.codex}"
   local dest="${codex_home}/skills"
+  local src_root="."
 
   log_info "Installing skills to ${dest}..."
   mkdir -p "$dest"
 
+  if [[ ! -d "skills" && ! -d "external/skills" ]]; then
+    src_root=$(fetch_repo_archive || echo "")
+  fi
+
+  if [[ -z "$src_root" ]]; then
+    log_warn "No skills source available; skipping"
+    return 0
+  fi
+
   # Copy first-party skills
-  if [[ -d "skills" ]]; then
-    for d in skills/*; do
+  if [[ -d "${src_root}/skills" ]]; then
+    for d in "${src_root}/skills"/*; do
       [[ -d "$d" ]] || continue
       [[ -f "$d/SKILL.md" ]] || continue
       local name
@@ -467,11 +519,13 @@ install_skills() {
       rm -rf "${dest:?}/${name}"
       cp -R "$d" "$dest/"
     done
+  else
+    log_warn "No skills directory found in source; skipping first-party skills"
   fi
 
   # Copy external skills (imported)
-  if [[ -d "external/skills" ]]; then
-    for d in external/skills/*; do
+  if [[ -d "${src_root}/external/skills" ]]; then
+    for d in "${src_root}/external/skills"/*; do
       [[ -d "$d" ]] || continue
       [[ -f "$d/SKILL.md" ]] || continue
       local name
@@ -479,6 +533,8 @@ install_skills() {
       rm -rf "${dest:?}/${name}"
       cp -R "$d" "$dest/"
     done
+  else
+    log_warn "No external skills directory found in source; skipping external skills"
   fi
 
   log_success "Skills installed (restart Codex to pick up changes)"
@@ -492,13 +548,25 @@ install_hooks() {
 
   local codex_home="${CODEX_HOME:-${HOME}/.codex}"
   local dest="${codex_home}/hooks"
+  local src_root="."
+  local hook_src=""
 
   log_info "Installing hooks to ${dest}..."
   mkdir -p "$dest"
 
-  if [[ -d "hooks" ]]; then
+  if [[ ! -d "hooks" ]]; then
+    src_root=$(fetch_repo_archive || echo "")
+  fi
+
+  if [[ -n "$src_root" && -d "${src_root}/hooks" ]]; then
+    hook_src="${src_root}/hooks"
+  elif [[ -d "hooks" ]]; then
+    hook_src="hooks"
+  fi
+
+  if [[ -n "$hook_src" ]]; then
     rm -rf "${dest:?}"
-    cp -R "hooks" "$dest"
+    cp -R "$hook_src" "$dest"
     log_success "Hooks installed"
   else
     log_warn "No hooks directory found; skipping"
