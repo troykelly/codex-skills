@@ -26,6 +26,23 @@ This is not optional. This is not a suggestion. This is a hard gate.
 echo $GITHUB_PROJECT      # Full URL: https://github.com/users/USER/projects/N
 echo $GITHUB_PROJECT_NUM  # Just the number: N
 echo $GH_PROJECT_OWNER    # Owner: @me or org name
+
+# If GITHUB_PROJECT is set, derive missing values automatically:
+if [ -z "$GITHUB_PROJECT_NUM" ] && [ -n "$GITHUB_PROJECT" ]; then
+  NUM_CANDIDATE=$(echo "$GITHUB_PROJECT" | sed -E 's#.*/projects/([0-9]+).*#\1#')
+  if [ -n "$NUM_CANDIDATE" ] && [ "$NUM_CANDIDATE" != "$GITHUB_PROJECT" ]; then
+    export GITHUB_PROJECT_NUM="$NUM_CANDIDATE"
+    echo "Derived GITHUB_PROJECT_NUM=$GITHUB_PROJECT_NUM from GITHUB_PROJECT"
+  fi
+fi
+
+if [ -z "$GH_PROJECT_OWNER" ] && [ -n "$GITHUB_PROJECT" ]; then
+  OWNER_CANDIDATE=$(echo "$GITHUB_PROJECT" | sed -E 's#https://github.com/(orgs|users)/([^/]+)/projects/[0-9]+#\2#')
+  if [ -n "$OWNER_CANDIDATE" ] && [ "$OWNER_CANDIDATE" != "$GITHUB_PROJECT" ]; then
+    export GH_PROJECT_OWNER="$OWNER_CANDIDATE"
+    echo "Derived GH_PROJECT_OWNER=$GH_PROJECT_OWNER from GITHUB_PROJECT"
+  fi
+fi
 ```
 
 If any are missing, stop and configure them before proceeding.
@@ -39,7 +56,7 @@ Every project MUST have these fields configured:
 | Field | Type | Required Values |
 |-------|------|-----------------|
 | Status | Single select | Backlog, Ready, In Progress, In Review, Done, Blocked |
-| Type | Single select | Feature, Bug, Chore, Research, Spike, Epic, Initiative |
+| Type (or Issue Type) | Single select | Feature, Bug, Chore, Research, Spike, Epic, Initiative |
 | Priority | Single select | Critical, High, Medium, Low |
 
 ### Recommended Fields
@@ -179,13 +196,20 @@ set_project_type() {
   PROJECT_ID=$(gh project list --owner "$GH_PROJECT_OWNER" --format json | \
     jq -r ".projects[] | select(.number == $GITHUB_PROJECT_NUM) | .id")
 
+  TYPE_FIELD_NAME="Type"
+  if ! gh project field-list "$GITHUB_PROJECT_NUM" --owner "$GH_PROJECT_OWNER" --format json | jq -e '.fields[] | select(.name == "Type")' >/dev/null 2>&1; then
+    if gh project field-list "$GITHUB_PROJECT_NUM" --owner "$GH_PROJECT_OWNER" --format json | jq -e '.fields[] | select(.name == "Issue Type")' >/dev/null 2>&1; then
+      TYPE_FIELD_NAME="Issue Type"
+    fi
+  fi
+
   TYPE_FIELD_ID=$(gh project field-list "$GITHUB_PROJECT_NUM" --owner "$GH_PROJECT_OWNER" \
     --format json | \
-    jq -r '.fields[] | select(.name == "Type") | .id')
+    jq -r --arg type_field "$TYPE_FIELD_NAME" '.fields[] | select(.name == $type_field) | .id')
 
   OPTION_ID=$(gh project field-list "$GITHUB_PROJECT_NUM" --owner "$GH_PROJECT_OWNER" \
     --format json | \
-    jq -r ".fields[] | select(.name == \"Type\") | .options[] | select(.name == \"$type\") | .id")
+    jq -r --arg type_field "$TYPE_FIELD_NAME" --arg type_value "$type" '.fields[] | select(.name == $type_field) | .options[] | select(.name == $type_value) | .id')
 
   gh project item-edit --project-id "$PROJECT_ID" --id "$item_id" \
     --field-id "$TYPE_FIELD_ID" --single-select-option-id "$OPTION_ID"

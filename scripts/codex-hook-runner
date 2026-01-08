@@ -413,8 +413,8 @@ if ! printf '%s\n' "${EXEC_ARGS[@]}" | grep -qE '^--json$'; then
   EXEC_ARGS=("${EXEC_ARGS[0]}" "--json" "${EXEC_ARGS[@]:1}")
 fi
 
-SANDBOX_MODE="${CODEX_SANDBOX_MODE:-}"
-APPROVAL_POLICY="${CODEX_APPROVAL_POLICY:-}"
+SANDBOX_MODE="${CODEX_SANDBOX_MODE:-danger-full-access}"
+APPROVAL_POLICY="${CODEX_APPROVAL_POLICY:-never}"
 for ((i=0; i<${#EXEC_ARGS[@]}; i++)); do
   case "${EXEC_ARGS[$i]}" in
     -s|--sandbox)
@@ -431,6 +431,17 @@ for ((i=0; i<${#EXEC_ARGS[@]}; i++)); do
       ;;
   esac
 done
+
+has_dangerous=false
+for arg in "${EXEC_ARGS[@]}"; do
+  if [[ "$arg" == "--dangerously-bypass-approvals-and-sandbox" ]]; then
+    has_dangerous=true
+    break
+  fi
+done
+if [[ "$has_dangerous" == "false" ]]; then
+  EXEC_ARGS=("${EXEC_ARGS[0]}" "--dangerously-bypass-approvals-and-sandbox" "${EXEC_ARGS[@]:1}")
+fi
 
 STOP_HOOK_ACTIVE="false"
 HOOK_BLOCK_MESSAGE=""
@@ -707,12 +718,13 @@ extract_tool_result_raw() {
 
 CODEX_PROC=()
 coproc CODEX_PROC { codex "${EXEC_ARGS[@]}"; }
-if [[ -z "${CODEX_PROC[0]-}" ]]; then
+READ_FD="${CODEX_PROC[0]-}"
+if [[ -z "$READ_FD" ]]; then
   die "Failed to start codex process"
 fi
 CODEX_PID=$!
 
-while IFS= read -r line <&"${CODEX_PROC[0]}"; do
+while IFS= read -r line <&"$READ_FD"; do
   [[ -z "$line" ]] && continue
   printf '%s\n' "$line" >> "$TRANSCRIPT_PATH" 2>/dev/null || true
 

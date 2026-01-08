@@ -67,6 +67,23 @@ Every work request flows through intake. This skill determines scope, gathers re
 This is a gate. Do not proceed to clarifying questions until this passes.
 
 ```bash
+# Derive defaults from GITHUB_PROJECT if provided
+if [ -z "$GITHUB_PROJECT_NUM" ] && [ -n "$GITHUB_PROJECT" ]; then
+  NUM_CANDIDATE=$(echo "$GITHUB_PROJECT" | sed -E 's#.*/projects/([0-9]+).*#\1#')
+  if [ -n "$NUM_CANDIDATE" ] && [ "$NUM_CANDIDATE" != "$GITHUB_PROJECT" ]; then
+    export GITHUB_PROJECT_NUM="$NUM_CANDIDATE"
+    echo "Derived GITHUB_PROJECT_NUM=$GITHUB_PROJECT_NUM from GITHUB_PROJECT"
+  fi
+fi
+
+if [ -z "$GH_PROJECT_OWNER" ] && [ -n "$GITHUB_PROJECT" ]; then
+  OWNER_CANDIDATE=$(echo "$GITHUB_PROJECT" | sed -E 's#https://github.com/(orgs|users)/([^/]+)/projects/[0-9]+#\2#')
+  if [ -n "$OWNER_CANDIDATE" ] && [ "$OWNER_CANDIDATE" != "$GITHUB_PROJECT" ]; then
+    export GH_PROJECT_OWNER="$OWNER_CANDIDATE"
+    echo "Derived GH_PROJECT_OWNER=$GH_PROJECT_OWNER from GITHUB_PROJECT"
+  fi
+fi
+
 # Verify environment variables are set
 if [ -z "$GITHUB_PROJECT_NUM" ]; then
   echo "BLOCKED: GITHUB_PROJECT_NUM not set"
@@ -90,12 +107,16 @@ fi
 # Verify required fields exist
 FIELDS=$(gh project field-list "$GITHUB_PROJECT_NUM" --owner "$GH_PROJECT_OWNER" --format json | jq -r '.fields[].name')
 
-for required in "Status" "Type" "Priority"; do
+for required in "Status" "Priority"; do
   if ! echo "$FIELDS" | grep -q "^$required$"; then
     echo "WARNING: Required field '$required' not found in project"
     echo "Consider adding this field for full tracking support"
   fi
 done
+if ! echo "$FIELDS" | grep -q "^Type$" && ! echo "$FIELDS" | grep -q "^Issue Type$"; then
+  echo "WARNING: Required field 'Type' (or 'Issue Type') not found in project"
+  echo "Consider adding this field for full tracking support"
+fi
 
 echo "Project board ready: $GITHUB_PROJECT_NUM"
 ```

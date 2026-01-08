@@ -82,6 +82,23 @@ Use this skill when you receive:
 **Before any triage, verify project board infrastructure is ready.**
 
 ```bash
+# Derive defaults from GITHUB_PROJECT if provided
+if [ -z "$GITHUB_PROJECT_NUM" ] && [ -n "$GITHUB_PROJECT" ]; then
+  NUM_CANDIDATE=$(echo "$GITHUB_PROJECT" | sed -E 's#.*/projects/([0-9]+).*#\1#')
+  if [ -n "$NUM_CANDIDATE" ] && [ "$NUM_CANDIDATE" != "$GITHUB_PROJECT" ]; then
+    export GITHUB_PROJECT_NUM="$NUM_CANDIDATE"
+    echo "Derived GITHUB_PROJECT_NUM=$GITHUB_PROJECT_NUM from GITHUB_PROJECT"
+  fi
+fi
+
+if [ -z "$GH_PROJECT_OWNER" ] && [ -n "$GITHUB_PROJECT" ]; then
+  OWNER_CANDIDATE=$(echo "$GITHUB_PROJECT" | sed -E 's#https://github.com/(orgs|users)/([^/]+)/projects/[0-9]+#\2#')
+  if [ -n "$OWNER_CANDIDATE" ] && [ "$OWNER_CANDIDATE" != "$GITHUB_PROJECT" ]; then
+    export GH_PROJECT_OWNER="$OWNER_CANDIDATE"
+    echo "Derived GH_PROJECT_OWNER=$GH_PROJECT_OWNER from GITHUB_PROJECT"
+  fi
+fi
+
 # Verify environment variables
 if [ -z "$GITHUB_PROJECT_NUM" ]; then
   echo "BLOCKED: GITHUB_PROJECT_NUM not set"
@@ -482,8 +499,15 @@ PROJECT_ID=$(gh project list --owner "$GH_PROJECT_OWNER" --format json | \
 STATUS_FIELD_ID=$(gh project field-list "$GITHUB_PROJECT_NUM" --owner "$GH_PROJECT_OWNER" \
   --format json | jq -r '.fields[] | select(.name == "Status") | .id')
 
+TYPE_FIELD_NAME="Type"
+if ! gh project field-list "$GITHUB_PROJECT_NUM" --owner "$GH_PROJECT_OWNER" --format json | jq -e '.fields[] | select(.name == "Type")' >/dev/null 2>&1; then
+  if gh project field-list "$GITHUB_PROJECT_NUM" --owner "$GH_PROJECT_OWNER" --format json | jq -e '.fields[] | select(.name == "Issue Type")' >/dev/null 2>&1; then
+    TYPE_FIELD_NAME="Issue Type"
+  fi
+fi
+
 TYPE_FIELD_ID=$(gh project field-list "$GITHUB_PROJECT_NUM" --owner "$GH_PROJECT_OWNER" \
-  --format json | jq -r '.fields[] | select(.name == "Type") | .id')
+  --format json | jq -r --arg type_field "$TYPE_FIELD_NAME" '.fields[] | select(.name == $type_field) | .id')
 
 PRIORITY_FIELD_ID=$(gh project field-list "$GITHUB_PROJECT_NUM" --owner "$GH_PROJECT_OWNER" \
   --format json | jq -r '.fields[] | select(.name == "Priority") | .id')
@@ -497,7 +521,7 @@ gh project item-edit --project-id "$PROJECT_ID" --id "$ITEM_ID" \
 
 # Set Type (Bug, Feature, Research, etc.)
 TYPE_OPTION_ID=$(gh project field-list "$GITHUB_PROJECT_NUM" --owner "$GH_PROJECT_OWNER" \
-  --format json | jq -r ".fields[] | select(.name == \"Type\") | .options[] | select(.name == \"[TYPE]\") | .id")
+  --format json | jq -r --arg type_field "$TYPE_FIELD_NAME" --arg type_value "[TYPE]" '.fields[] | select(.name == $type_field) | .options[] | select(.name == $type_value) | .id')
 
 gh project item-edit --project-id "$PROJECT_ID" --id "$ITEM_ID" \
   --field-id "$TYPE_FIELD_ID" --single-select-option-id "$TYPE_OPTION_ID"

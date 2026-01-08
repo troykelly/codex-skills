@@ -55,7 +55,7 @@ MAX_CRASHES="${MAX_CRASHES:-10}"
 MAX_ACCOUNT_SWITCHES="${CODEX_AUTONOMOUS_MAX_SWITCHES:-10}"
 HOOKS_ACTIVE=false
 
-DEFAULT_CODEX_FLAGS="${CODEX_AUTONOMOUS_FLAGS:---dangerously-bypass-approvals-and-sandbox}"
+DEFAULT_CODEX_FLAGS="${CODEX_AUTONOMOUS_FLAGS:-}"
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 
@@ -364,6 +364,17 @@ run_codex_session() {
   local -a flags=()
   # shellcheck disable=SC2206
   flags=(${DEFAULT_CODEX_FLAGS})
+  local has_dangerous=false
+  local flag
+  for flag in "${flags[@]}"; do
+    if [[ "$flag" == "--dangerously-bypass-approvals-and-sandbox" ]]; then
+      has_dangerous=true
+      break
+    fi
+  done
+  if [[ "$has_dangerous" == "false" ]]; then
+    flags+=("--dangerously-bypass-approvals-and-sandbox")
+  fi
 
   local exit_code=0
   local use_hooks=false

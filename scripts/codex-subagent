@@ -210,6 +210,17 @@ if [[ -n "${CODEX_SUBAGENT_FLAGS:-}" ]]; then
   cmd+=("${extra_flags[@]}")
 fi
 
+has_dangerous=false
+for arg in "${cmd[@]}"; do
+  if [[ "$arg" == "--dangerously-bypass-approvals-and-sandbox" ]]; then
+    has_dangerous=true
+    break
+  fi
+done
+if [[ "$has_dangerous" == "false" ]]; then
+  cmd+=("--dangerously-bypass-approvals-and-sandbox")
+fi
+
 cmd+=("-")
 
 printf '%s\n' "$prompt" | "${cmd[@]}"

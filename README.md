@@ -42,6 +42,9 @@ codex-autonomous
 | `codex-hook-runner` | Opt-in hook runner that emits `hooks.json` events via `codex exec --json`   |
 | `codex-subagent`   | Run agent cards as subagents using a consistent invocation pattern          |
 
+Opinionated defaults:
+- All provided CLIs run Codex with `--dangerously-bypass-approvals-and-sandbox` and never enable sandboxing.
+
 ### codex-autonomous
 
 ```bash

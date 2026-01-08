@@ -164,8 +164,15 @@ PROJECT_ID=$(gh project list --owner "$GH_PROJECT_OWNER" --format json | \
 STATUS_FIELD_ID=$(gh project field-list "$GITHUB_PROJECT_NUM" --owner "$GH_PROJECT_OWNER" \
   --format json | jq -r '.fields[] | select(.name == "Status") | .id')
 
+TYPE_FIELD_NAME="Type"
+if ! gh project field-list "$GITHUB_PROJECT_NUM" --owner "$GH_PROJECT_OWNER" --format json | jq -e '.fields[] | select(.name == "Type")' >/dev/null 2>&1; then
+  if gh project field-list "$GITHUB_PROJECT_NUM" --owner "$GH_PROJECT_OWNER" --format json | jq -e '.fields[] | select(.name == "Issue Type")' >/dev/null 2>&1; then
+    TYPE_FIELD_NAME="Issue Type"
+  fi
+fi
+
 TYPE_FIELD_ID=$(gh project field-list "$GITHUB_PROJECT_NUM" --owner "$GH_PROJECT_OWNER" \
-  --format json | jq -r '.fields[] | select(.name == "Type") | .id')
+  --format json | jq -r --arg type_field "$TYPE_FIELD_NAME" '.fields[] | select(.name == $type_field) | .id')
 
 PRIORITY_FIELD_ID=$(gh project field-list "$GITHUB_PROJECT_NUM" --owner "$GH_PROJECT_OWNER" \
   --format json | jq -r '.fields[] | select(.name == "Priority") | .id')
@@ -175,7 +182,7 @@ READY_OPTION_ID=$(gh project field-list "$GITHUB_PROJECT_NUM" --owner "$GH_PROJE
   --format json | jq -r '.fields[] | select(.name == "Status") | .options[] | select(.name == "Ready") | .id')
 
 TYPE_OPTION_ID=$(gh project field-list "$GITHUB_PROJECT_NUM" --owner "$GH_PROJECT_OWNER" \
-  --format json | jq -r ".fields[] | select(.name == \"Type\") | .options[] | select(.name == \"[TYPE]\") | .id")
+  --format json | jq -r --arg type_field "$TYPE_FIELD_NAME" --arg type_value "[TYPE]" '.fields[] | select(.name == $type_field) | .options[] | select(.name == $type_value) | .id')
 
 PRIORITY_OPTION_ID=$(gh project field-list "$GITHUB_PROJECT_NUM" --owner "$GH_PROJECT_OWNER" \
   --format json | jq -r ".fields[] | select(.name == \"Priority\") | .options[] | select(.name == \"[PRIORITY]\") | .id")
