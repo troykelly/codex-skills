@@ -13,12 +13,14 @@
 #   --project-root <dir>  Project root for hook context (default: git root or pwd)
 #   --transcript <path>   Path to JSONL transcript log
 #   --prompt-mode <mode>  codex|print|skip (default: codex)
+#   --output <mode>       pretty|json|quiet (default: pretty)
 #   -h, --help            Show help
 #   -v, --version         Show version
 #
 # Environment:
 #   CODEX_HOME, CODEX_HOOK_ROOT, CODEX_HOOK_CONFIG, CODEX_HOOK_PROMPT_MODE,
-#   CODEX_HOOK_BLOCK_FILE, CODEX_SESSION_ID, CODEX_PROJECT_ROOT
+#   CODEX_HOOK_BLOCK_FILE, CODEX_SESSION_ID, CODEX_PROJECT_ROOT,
+#   CODEX_HOOK_OUTPUT, CODEX_HOOK_SHOW_REASONING, CODEX_HOOK_SHOW_USAGE
 #
 
 set -euo pipefail
@@ -26,7 +28,10 @@ set -euo pipefail
 VERSION="1.0.0"
 
 RED='\033[0;31m'
+GREEN='\033[0;32m'
 YELLOW='\033[1;33m'
+BLUE='\033[0;34m'
+CYAN='\033[0;36m'
 NC='\033[0m'
 
 usage() {
@@ -111,6 +116,9 @@ HOOKS_FILE="${CODEX_HOOK_CONFIG:-}"
 PROJECT_ROOT="${CODEX_PROJECT_ROOT:-}"
 TRANSCRIPT_PATH="${CODEX_HOOK_TRANSCRIPT:-}"
 PROMPT_MODE="${CODEX_HOOK_PROMPT_MODE:-codex}"
+OUTPUT_MODE="${CODEX_HOOK_OUTPUT:-pretty}"
+SHOW_REASONING="${CODEX_HOOK_SHOW_REASONING:-false}"
+SHOW_USAGE="${CODEX_HOOK_SHOW_USAGE:-false}"
 
 while [[ $# -gt 0 ]]; do
   case "$1" in
@@ -132,6 +140,10 @@ while [[ $# -gt 0 ]]; do
       ;;
     --prompt-mode)
       PROMPT_MODE="${2:-}"
+      shift 2
+      ;;
+    --output)
+      OUTPUT_MODE="${2:-}"
       shift 2
       ;;
     -h|--help)
@@ -211,6 +223,170 @@ fi
 if ! has_cmd codex; then
   die "codex CLI not found in PATH"
 fi
+
+format_tool_label() {
+  local server="$1"
+  local tool="$2"
+
+  if [[ -n "$server" && -n "$tool" ]]; then
+    printf '%s.%s' "$server" "$tool"
+  elif [[ -n "$server" ]]; then
+    printf '%s' "$server"
+  else
+    printf '%s' "$tool"
+  fi
+}
+
+emit_pretty() {
+  local line="$1"
+  local event_type item_type
+
+  event_type=$(echo "$line" | jq -r '.type // empty' 2>/dev/null || true)
+
+  case "$event_type" in
+    thread.started)
+      local thread_id
+      thread_id=$(echo "$line" | jq -r '.thread_id // .threadId // .thread.id // empty' 2>/dev/null || true)
+      if [[ -n "$thread_id" ]]; then
+        echo -e "${CYAN}== Session ${thread_id} ==${NC}"
+      else
+        echo -e "${CYAN}== Session started ==${NC}"
+      fi
+      ;;
+    turn.started)
+      echo -e "${CYAN}---${NC}"
+      ;;
+    turn.completed)
+      if [[ "$SHOW_USAGE" == "true" ]]; then
+        local input_tokens output_tokens usage
+        input_tokens=$(echo "$line" | jq -r '.usage.input_tokens // .usage.inputTokens // empty' 2>/dev/null || true)
+        output_tokens=$(echo "$line" | jq -r '.usage.output_tokens // .usage.outputTokens // empty' 2>/dev/null || true)
+        usage=""
+        if [[ -n "$input_tokens" ]]; then
+          usage="in=${input_tokens}"
+        fi
+        if [[ -n "$output_tokens" ]]; then
+          if [[ -n "$usage" ]]; then
+            usage="${usage} out=${output_tokens}"
+          else
+            usage="out=${output_tokens}"
+          fi
+        fi
+        if [[ -n "$usage" ]]; then
+          echo -e "${CYAN}[USAGE]${NC} ${usage}"
+        fi
+      fi
+      ;;
+    item.started)
+      item_type=$(echo "$line" | jq -r '.item.type // empty' 2>/dev/null || true)
+      case "$item_type" in
+        command_execution)
+          local command
+          command=$(echo "$line" | jq -r '.item.command // empty' 2>/dev/null || true)
+          if [[ -n "$command" ]]; then
+            echo -e "${BLUE}[RUN]${NC} ${command}"
+          fi
+          ;;
+        mcp_tool_call)
+          local server tool label status
+          server=$(echo "$line" | jq -r '.item.server // empty' 2>/dev/null || true)
+          tool=$(echo "$line" | jq -r '.item.tool // empty' 2>/dev/null || true)
+          status=$(echo "$line" | jq -r '.item.status // empty' 2>/dev/null || true)
+          label=$(format_tool_label "$server" "$tool")
+          if [[ -n "$label" ]]; then
+            if [[ -n "$status" ]]; then
+              echo -e "${BLUE}[MCP]${NC} ${label} ${status}"
+            else
+              echo -e "${BLUE}[MCP]${NC} ${label}"
+            fi
+          fi
+          ;;
+      esac
+      ;;
+    item.completed)
+      item_type=$(echo "$line" | jq -r '.item.type // empty' 2>/dev/null || true)
+      case "$item_type" in
+        agent_message)
+          local text
+          text=$(echo "$line" | jq -r '.item.text // empty' 2>/dev/null || true)
+          if [[ -n "$text" ]]; then
+            echo -e "${GREEN}[AGENT]${NC} ${text}"
+          fi
+          ;;
+        reasoning)
+          if [[ "$SHOW_REASONING" == "true" ]]; then
+            local text
+            text=$(echo "$line" | jq -r '.item.text // empty' 2>/dev/null || true)
+            if [[ -n "$text" ]]; then
+              echo -e "${CYAN}[THINK]${NC} ${text}"
+            fi
+          fi
+          ;;
+        command_execution)
+          local command exit_code output
+          command=$(echo "$line" | jq -r '.item.command // empty' 2>/dev/null || true)
+          exit_code=$(echo "$line" | jq -r '.item.exit_code // empty' 2>/dev/null || true)
+          output=$(echo "$line" | jq -r '.item.aggregated_output // empty' 2>/dev/null || true)
+
+          if [[ -n "$command" ]]; then
+            if [[ -n "$exit_code" && "$exit_code" != "null" ]]; then
+              if [[ "$exit_code" == "0" ]]; then
+                echo -e "${GREEN}[OK]${NC} ${command}"
+              else
+                echo -e "${RED}[FAIL]${NC} ${command} (exit ${exit_code})"
+              fi
+            else
+              echo -e "${BLUE}[RUN]${NC} ${command}"
+            fi
+          fi
+
+          if [[ -n "$output" && "$output" != "null" ]]; then
+            printf '%s\n' "$output"
+          fi
+          ;;
+        mcp_tool_call)
+          local server tool label status error
+          server=$(echo "$line" | jq -r '.item.server // empty' 2>/dev/null || true)
+          tool=$(echo "$line" | jq -r '.item.tool // empty' 2>/dev/null || true)
+          status=$(echo "$line" | jq -r '.item.status // empty' 2>/dev/null || true)
+          error=$(echo "$line" | jq -r '.item.error // empty' 2>/dev/null || true)
+          label=$(format_tool_label "$server" "$tool")
+          if [[ -n "$label" ]]; then
+            if [[ "$status" == "completed" ]]; then
+              echo -e "${GREEN}[MCP]${NC} ${label} completed"
+            elif [[ -n "$status" ]]; then
+              echo -e "${YELLOW}[MCP]${NC} ${label} ${status}"
+            else
+              echo -e "${BLUE}[MCP]${NC} ${label}"
+            fi
+          fi
+          if [[ -n "$error" && "$error" != "null" ]]; then
+            echo -e "${RED}[MCP-ERROR]${NC} ${error}"
+          fi
+          ;;
+      esac
+      ;;
+  esac
+}
+
+emit_output() {
+  local line="$1"
+
+  case "$OUTPUT_MODE" in
+    json)
+      printf '%s\n' "$line"
+      ;;
+    quiet)
+      ;;
+    pretty|*)
+      if echo "$line" | jq -e . >/dev/null 2>&1; then
+        emit_pretty "$line"
+      else
+        printf '%s\n' "$line"
+      fi
+      ;;
+  esac
+}
 
 CODEX_ARGS=("$@")
 if [[ "${CODEX_ARGS[0]}" == "codex" ]]; then
@@ -541,7 +717,7 @@ while IFS= read -r line <&"${CODEX_PROC[0]}"; do
   printf '%s\n' "$line" >> "$TRANSCRIPT_PATH" 2>/dev/null || true
 
   if ! echo "$line" | jq -e . >/dev/null 2>&1; then
-    printf '%s\n' "$line"
+    emit_output "$line"
     continue
   fi
 
@@ -573,7 +749,7 @@ while IFS= read -r line <&"${CODEX_PROC[0]}"; do
         break
       fi
     fi
-    printf '%s\n' "$line"
+    emit_output "$line"
     continue
   fi
 
@@ -590,11 +766,11 @@ while IFS= read -r line <&"${CODEX_PROC[0]}"; do
         break
       fi
     fi
-    printf '%s\n' "$line"
+    emit_output "$line"
     continue
   fi
 
-  printf '%s\n' "$line"
+  emit_output "$line"
 done
 
 wait "$CODEX_PID" || CODEX_EXIT=$?

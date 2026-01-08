@@ -42,6 +42,16 @@ codex-autonomous
 | `codex-hook-runner` | Opt-in hook runner that emits `hooks.json` events via `codex exec --json`   |
 | `codex-subagent`   | Run agent cards as subagents using a consistent invocation pattern          |
 
+### codex-autonomous
+
+```bash
+codex-autonomous --new
+```
+
+Notes:
+- `--new` prompts for instructions before starting Codex.
+- Set `CODEX_NEW_PROMPT` to skip the interactive prompt (useful for scripts).
+
 ### Skills
 
 - `skills/` contains the core workflow skills (ported from `claude-skills`)
@@ -70,7 +80,9 @@ codex-hook-runner exec "Your prompt"
 
 Notes:
 - Hook runner uses `codex exec --json` and writes a JSONL transcript (default: `.codex/logs/`)
-- `codex-autonomous` uses `codex exec` when hooks are enabled (output is JSONL)
+- Hook runner output is prettified by default; set `CODEX_HOOK_OUTPUT=json` for raw JSON
+- Set `CODEX_HOOK_SHOW_REASONING=true` or `CODEX_HOOK_SHOW_USAGE=true` to include extra details
+- `codex-autonomous` uses `codex exec` when hooks are enabled (pretty output by default)
 - Override locations with `CODEX_HOOK_ROOT` and `CODEX_HOOK_CONFIG`
 - Control prompt hooks with `CODEX_HOOK_PROMPT_MODE=codex|print|skip`
 

@@ -7,7 +7,7 @@
 #
 # Options:
 #   -e, --epic <N>       Focus on a specific epic/issue number
-#   -n, --new            Bootstrap worktree, then wait for instructions
+#   -n, --new            Bootstrap worktree, then prompt for instructions
 #   -c, --continue       Resume the most recent autonomous session
 #   --resume [ID]        Resume a session (worktree id or Codex session UUID). If omitted, shows list
 #   -l, --list           List autonomous session history
@@ -24,6 +24,7 @@
 #   CODEX_AUTONOMOUS_MAX_SWITCHES    Max account switches per session (default: 10)
 #   CODEX_ACCOUNT_COOLDOWN_MINUTES   Cooldown after account exhaustion (default: 5)
 #   CODEX_DISABLE_HOOKS             Disable hook runner integration (default: false)
+#   CODEX_NEW_PROMPT                 Initial prompt for --new (skips interactive prompt)
 #   CODEX_HOOK_RUNNER               Path to codex-hook-runner (default: scripts/codex-hook-runner or PATH)
 #   CODEX_HOOK_ROOT                  Hook root directory (default: $CODEX_HOME/hooks)
 #   CODEX_HOOK_CONFIG                Path to hooks.json (default: $CODEX_HOOK_ROOT/hooks.json)
@@ -90,6 +91,33 @@ hooks_enabled() {
     1|true|yes) return 1 ;;
   esac
   return 0
+}
+
+read_new_prompt() {
+  local prompt="${CODEX_NEW_PROMPT:-}"
+
+  if [[ -n "$prompt" ]]; then
+    printf '%s\n' "$prompt"
+    return 0
+  fi
+
+  if [[ ! -t 0 ]]; then
+    printf '%s\n' ""
+    return 0
+  fi
+
+  echo -e "${GREEN}Codex is ready for instructions.${NC}"
+  while true; do
+    if ! read -r -p "Describe the task (Ctrl-D to cancel): " prompt; then
+      printf '%s\n' ""
+      return 0
+    fi
+    if [[ -n "$prompt" ]]; then
+      printf '%s\n' "$prompt"
+      return 0
+    fi
+    log_warn "No instructions entered. Please describe the task."
+  done
 }
 
 resolve_hook_runner() {
@@ -635,6 +663,14 @@ echo ""
 
 cd "$WORKTREE_DIR"
 
+USER_PROMPT=""
+if [[ "$NEW_MODE" == "true" ]]; then
+  USER_PROMPT=$(read_new_prompt)
+  if [[ -z "$USER_PROMPT" ]]; then
+    die "No instructions provided. Re-run with --new and enter a task or set CODEX_NEW_PROMPT."
+  fi
+fi
+
 if [[ "$NEW_MODE" == "true" ]]; then
   INITIAL_PROMPT="You are working in an isolated git worktree at: ${WORKTREE_DIR}
 
@@ -645,8 +681,8 @@ ENVIRONMENT:
 - GitHub token configured for API access
 - Run tests/builds locally before PRs
 
-READY FOR INSTRUCTIONS:
-I am bootstrapped and ready. Please provide instructions."
+USER REQUEST:
+${USER_PROMPT}"
 else
   if [[ -n "$EPIC" ]]; then
     EPIC_INSTRUCTION="Focus exclusively on Epic #${EPIC} and its child issues. Do not work on unrelated issues."
@@ -686,7 +722,11 @@ ACCOUNT_SWITCHES=0
 MSG=""
 FIRST_RUN=true
 
-log_ok "Starting autonomous operation..."
+if [[ "$NEW_MODE" == "true" ]]; then
+  log_ok "Starting Codex session..."
+else
+  log_ok "Starting autonomous operation..."
+fi
 echo ""
 
 while true; do
