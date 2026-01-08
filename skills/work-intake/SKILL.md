@@ -76,11 +76,25 @@ if [ -z "$GITHUB_PROJECT_NUM" ] && [ -n "$GITHUB_PROJECT" ]; then
   fi
 fi
 
+if [ -z "$GH_PROJECT_OWNER" ] && [ -n "$GITHUB_OWNER" ]; then
+  export GH_PROJECT_OWNER="$GITHUB_OWNER"
+  echo "Derived GH_PROJECT_OWNER=$GH_PROJECT_OWNER from GITHUB_OWNER"
+fi
+
 if [ -z "$GH_PROJECT_OWNER" ] && [ -n "$GITHUB_PROJECT" ]; then
   OWNER_CANDIDATE=$(echo "$GITHUB_PROJECT" | sed -E 's#https://github.com/(orgs|users)/([^/]+)/projects/[0-9]+#\2#')
   if [ -n "$OWNER_CANDIDATE" ] && [ "$OWNER_CANDIDATE" != "$GITHUB_PROJECT" ]; then
     export GH_PROJECT_OWNER="$OWNER_CANDIDATE"
     echo "Derived GH_PROJECT_OWNER=$GH_PROJECT_OWNER from GITHUB_PROJECT"
+  fi
+fi
+
+if [ -z "$GH_PROJECT_OWNER" ]; then
+  REMOTE_URL=$(git remote get-url origin 2>/dev/null || true)
+  OWNER_CANDIDATE=$(echo "$REMOTE_URL" | sed -E 's#(git@|https://)github.com[:/]+([^/]+)/[^/]+(\.git)?#\2#')
+  if [ -n "$OWNER_CANDIDATE" ] && [ "$OWNER_CANDIDATE" != "$REMOTE_URL" ]; then
+    export GH_PROJECT_OWNER="$OWNER_CANDIDATE"
+    echo "Derived GH_PROJECT_OWNER=$GH_PROJECT_OWNER from git remote"
   fi
 fi
 
