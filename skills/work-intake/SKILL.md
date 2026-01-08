@@ -147,7 +147,13 @@ echo "Project board ready: $GITHUB_PROJECT_NUM"
 
 ## Step 1: Clarifying Questions
 
-Before scoping, understand the request:
+Before scoping, understand the request.
+
+**Do not ask questions that can be answered from the repo.** First inspect:
+- `README.md`, `FEATURES.md`, `BRANDING.md`, `docs/`, Storybook, and existing routes/pages
+- Existing GitHub issues and project board items
+
+Only ask the user for information that is still missing after reviewing the repo.
 
 ### Essential Questions
 

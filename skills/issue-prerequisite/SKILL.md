@@ -69,13 +69,29 @@ gh issue view [ISSUE_NUMBER] --json url
 
 ## When No Issue is Provided
 
+**Do not stop to ask for an issue number if the project board already contains the answer.**
+
+Before asking the user:
+1. Scan the project board for `Ready` or `In Progress` items matching the request (keywords, title, area).
+2. If exactly one candidate fits, use it and proceed.
+3. If none fit, create a new issue from the request + repo docs (README, FEATURES.md, BRANDING.md, docs, Storybook) without asking.
+4. Only ask the user if multiple candidates exist or critical details are genuinely missing after repo review.
+
+Suggested query:
+
+```bash
+# List Ready + In Progress issues with titles
+gh project item-list "$GITHUB_PROJECT_NUM" --owner "$GH_PROJECT_OWNER" --format json | \
+  jq -r '.items[] | select(.status.name == "Ready" or .status.name == "In Progress") | "\(.content.number) \(.content.title)"'
+```
+
 ### Option 1: User has existing issue
 
-Ask: "What's the GitHub issue number for this work?"
+Ask only if multiple candidates exist: "Which GitHub issue number should I use for this work?"
 
 ### Option 2: Need to create issue
 
-Gather information to create an issue:
+If creation is required and details are missing after repo review, gather information to create an issue:
 
 ```markdown
 I need to create a GitHub issue before starting this work.

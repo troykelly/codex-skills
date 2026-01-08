@@ -54,6 +54,9 @@ codex-autonomous --new
 Notes:
 - `--new` prompts for instructions before starting Codex.
 - Set `CODEX_NEW_PROMPT` to skip the interactive prompt (useful for scripts).
+- If Codex asks a question, `codex-autonomous` will prompt for a reply and resume automatically.
+- Disable that behavior with `CODEX_AUTONOMOUS_INTERACTIVE=false`.
+- Force a prompt every turn with `CODEX_AUTONOMOUS_ALWAYS_PROMPT=true` (useful for scripted runs).
 
 ### Skills
 
