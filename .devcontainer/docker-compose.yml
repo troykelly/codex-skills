@@ -1,0 +1,26 @@
+version: '3.8'
+
+services:
+  app:
+    build:
+      context: ..
+      dockerfile: .devcontainer/Dockerfile
+
+    volumes:
+      - ../..:/workspaces:cached
+      - codex-skills-vscode-home:/home/vscode
+    env_file:
+      - ../.env
+    networks:
+      - codex-skills-network
+
+    # Overrides default command so things don't shut down after the process ends.
+    command: sleep infinity
+
+volumes:
+  codex-skills-vscode-home:
+
+networks:
+  codex-skills-network:
+    driver: bridge
+    enable_ipv6: true

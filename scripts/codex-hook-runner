@@ -1,0 +1,609 @@
+#!/usr/bin/env bash
+#
+# codex-hook-runner - Run Codex with hook events from hooks.json
+#
+# Usage:
+#   codex-hook-runner [options] -- [codex exec args...]
+#   codex-hook-runner exec [args...]
+#   codex-hook-runner resume <id> [prompt]
+#
+# Options:
+#   --hooks <path>        Path to hooks.json (default: $CODEX_HOOK_ROOT/hooks.json)
+#   --hook-root <dir>     Directory containing hooks.json and scripts
+#   --project-root <dir>  Project root for hook context (default: git root or pwd)
+#   --transcript <path>   Path to JSONL transcript log
+#   --prompt-mode <mode>  codex|print|skip (default: codex)
+#   -h, --help            Show help
+#   -v, --version         Show version
+#
+# Environment:
+#   CODEX_HOME, CODEX_HOOK_ROOT, CODEX_HOOK_CONFIG, CODEX_HOOK_PROMPT_MODE,
+#   CODEX_HOOK_BLOCK_FILE, CODEX_SESSION_ID, CODEX_PROJECT_ROOT
+#
+
+set -euo pipefail
+
+VERSION="1.0.0"
+
+RED='\033[0;31m'
+YELLOW='\033[1;33m'
+NC='\033[0m'
+
+usage() {
+  awk '
+    NR==1 && /^#!/ { next }
+    /^#/ { sub(/^# ?/, ""); print; next }
+    { exit }
+  ' "$0"
+}
+
+has_cmd() { command -v "$1" >/dev/null 2>&1; }
+
+die() { echo -e "${RED}Error:${NC} $*" >&2; exit 1; }
+warn() { echo -e "${YELLOW}[WARN]${NC} $*" >&2; }
+
+uuid() {
+  uuidgen 2>/dev/null || cat /proc/sys/kernel/random/uuid 2>/dev/null || echo "$(date +%s)-${RANDOM}-${RANDOM}"
+}
+
+run_with_timeout() {
+  local timeout="${1:-}"
+  shift
+
+  if [[ -z "$timeout" || "$timeout" == "null" || "$timeout" == "0" ]]; then
+    "$@"
+    return $?
+  fi
+
+  if has_cmd timeout; then
+    timeout "${timeout}"s "$@"
+    return $?
+  fi
+
+  "$@" &
+  local pid=$!
+  local start
+  start=$(date +%s)
+
+  while kill -0 "$pid" 2>/dev/null; do
+    if (( $(date +%s) - start >= timeout )); then
+      kill -TERM "$pid" 2>/dev/null || true
+      sleep 1
+      kill -KILL "$pid" 2>/dev/null || true
+      return 124
+    fi
+    sleep 1
+  done
+
+  wait "$pid"
+  return $?
+}
+
+normalize_json() {
+  local raw="${1:-}"
+  if [[ -z "$raw" || "$raw" == "null" ]]; then
+    echo "null"
+    return 0
+  fi
+
+  if echo "$raw" | jq -e . >/dev/null 2>&1; then
+    if echo "$raw" | jq -e 'type=="string"' >/dev/null 2>&1; then
+      local parsed
+      parsed=$(echo "$raw" | jq -r 'fromjson?')
+      if [[ -n "$parsed" && "$parsed" != "null" ]] && echo "$parsed" | jq -e . >/dev/null 2>&1; then
+        echo "$parsed"
+        return 0
+      fi
+      local unquoted
+      unquoted=$(echo "$raw" | jq -r '.')
+      jq -cn --arg raw "$unquoted" '{raw: $raw}'
+      return 0
+    fi
+    echo "$raw"
+    return 0
+  fi
+
+  jq -cn --arg raw "$raw" '{raw: $raw}'
+}
+
+HOOK_ROOT="${CODEX_HOOK_ROOT:-}"
+HOOKS_FILE="${CODEX_HOOK_CONFIG:-}"
+PROJECT_ROOT="${CODEX_PROJECT_ROOT:-}"
+TRANSCRIPT_PATH="${CODEX_HOOK_TRANSCRIPT:-}"
+PROMPT_MODE="${CODEX_HOOK_PROMPT_MODE:-codex}"
+
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+    --hooks)
+      HOOKS_FILE="${2:-}"
+      shift 2
+      ;;
+    --hook-root)
+      HOOK_ROOT="${2:-}"
+      shift 2
+      ;;
+    --project-root)
+      PROJECT_ROOT="${2:-}"
+      shift 2
+      ;;
+    --transcript)
+      TRANSCRIPT_PATH="${2:-}"
+      shift 2
+      ;;
+    --prompt-mode)
+      PROMPT_MODE="${2:-}"
+      shift 2
+      ;;
+    -h|--help)
+      usage
+      exit 0
+      ;;
+    -v|--version)
+      echo "codex-hook-runner version ${VERSION}"
+      exit 0
+      ;;
+    --)
+      shift
+      break
+      ;;
+    *)
+      break
+      ;;
+  esac
+done
+
+if [[ $# -lt 1 ]]; then
+  usage
+  exit 1
+fi
+
+if [[ -z "$PROJECT_ROOT" ]]; then
+  PROJECT_ROOT=$(git rev-parse --show-toplevel 2>/dev/null || pwd)
+fi
+
+cd "$PROJECT_ROOT" || die "Failed to change directory to project root: $PROJECT_ROOT"
+
+if [[ -z "$HOOK_ROOT" ]]; then
+  if [[ -n "${CODEX_HOME:-}" && -d "${CODEX_HOME}/hooks" ]]; then
+    HOOK_ROOT="${CODEX_HOME}/hooks"
+  else
+    HOOK_ROOT="${PROJECT_ROOT}/hooks"
+  fi
+fi
+
+if [[ -z "$HOOKS_FILE" ]]; then
+  HOOKS_FILE="${HOOK_ROOT}/hooks.json"
+fi
+
+if [[ ! -f "$HOOKS_FILE" ]]; then
+  warn "hooks.json not found at ${HOOKS_FILE}; continuing without hooks"
+fi
+
+if [[ -z "$TRANSCRIPT_PATH" ]]; then
+  TRANSCRIPT_PATH="${PROJECT_ROOT}/.codex/logs/hook-transcript-$(date +%Y%m%d_%H%M%S).jsonl"
+fi
+
+mkdir -p "$(dirname "$TRANSCRIPT_PATH")" 2>/dev/null || true
+
+SESSION_ID="${CODEX_SESSION_ID:-}"
+if [[ -z "$SESSION_ID" ]]; then
+  SESSION_ID="$(uuid)"
+fi
+
+export CODEX_SESSION_ID="$SESSION_ID"
+export CODEX_PROJECT_ROOT="$PROJECT_ROOT"
+export CODEX_HOOK_ROOT="$HOOK_ROOT"
+
+CODEX_SESSION_MARKER="/tmp/codex-session-marker"
+printf '%s\n' "$SESSION_ID" > "$CODEX_SESSION_MARKER" 2>/dev/null || true
+
+CODEX_HOOK_BLOCK_FILE="${CODEX_HOOK_BLOCK_FILE:-}"
+if [[ -z "$CODEX_HOOK_BLOCK_FILE" ]]; then
+  CODEX_HOOK_BLOCK_FILE="${CODEX_HOME:-${HOME}/.codex}/.hook-block.${SESSION_ID}"
+fi
+export CODEX_HOOK_BLOCK_FILE
+rm -f "$CODEX_HOOK_BLOCK_FILE" 2>/dev/null || true
+
+if ! has_cmd jq; then
+  die "jq is required for hook parsing (install jq)"
+fi
+
+CODEX_ARGS=("$@")
+if [[ "${CODEX_ARGS[0]}" == "codex" ]]; then
+  CODEX_ARGS=("${CODEX_ARGS[@]:1}")
+fi
+
+EXEC_ARGS=()
+case "${CODEX_ARGS[0]}" in
+  exec)
+    EXEC_ARGS=("exec" "${CODEX_ARGS[@]:1}")
+    ;;
+  resume)
+    EXEC_ARGS=("exec" "resume" "${CODEX_ARGS[@]:1}")
+    ;;
+  review)
+    EXEC_ARGS=("exec" "review" "${CODEX_ARGS[@]:1}")
+    ;;
+  *)
+    EXEC_ARGS=("exec" "${CODEX_ARGS[@]}")
+    ;;
+esac
+
+if ! printf '%s\n' "${EXEC_ARGS[@]}" | grep -qE '^--json$'; then
+  EXEC_ARGS=("${EXEC_ARGS[0]}" "--json" "${EXEC_ARGS[@]:1}")
+fi
+
+SANDBOX_MODE="${CODEX_SANDBOX_MODE:-}"
+APPROVAL_POLICY="${CODEX_APPROVAL_POLICY:-}"
+for ((i=0; i<${#EXEC_ARGS[@]}; i++)); do
+  case "${EXEC_ARGS[$i]}" in
+    -s|--sandbox)
+      SANDBOX_MODE="${EXEC_ARGS[$((i+1))]:-}"
+      i=$((i+1))
+      ;;
+    -a|--ask-for-approval)
+      APPROVAL_POLICY="${EXEC_ARGS[$((i+1))]:-}"
+      i=$((i+1))
+      ;;
+    --dangerously-bypass-approvals-and-sandbox)
+      SANDBOX_MODE="danger-full-access"
+      APPROVAL_POLICY="never"
+      ;;
+  esac
+done
+
+STOP_HOOK_ACTIVE="false"
+HOOK_BLOCK_MESSAGE=""
+
+build_hook_input() {
+  local event="$1"
+  local tool_name="$2"
+  local tool_input="$3"
+  local tool_result="$4"
+
+  jq -cn \
+    --arg event "$event" \
+    --arg hook_event_name "$event" \
+    --arg tool_name "$tool_name" \
+    --arg session_id "$SESSION_ID" \
+    --arg transcript_path "$TRANSCRIPT_PATH" \
+    --arg cwd "$PROJECT_ROOT" \
+    --arg approval_policy "$APPROVAL_POLICY" \
+    --arg sandbox_mode "$SANDBOX_MODE" \
+    --argjson tool_input "$tool_input" \
+    --argjson tool_result "$tool_result" \
+    --argjson stop_hook_active "$STOP_HOOK_ACTIVE" \
+    '{
+      event: $event,
+      hook_event_name: $hook_event_name,
+      tool_name: (if $tool_name != "" then $tool_name else null end),
+      tool_input: $tool_input,
+      tool_result: $tool_result,
+      session_id: (if $session_id != "" then $session_id else null end),
+      transcript_path: (if $transcript_path != "" then $transcript_path else null end),
+      cwd: (if $cwd != "" then $cwd else null end),
+      approval_policy: (if $approval_policy != "" then $approval_policy else null end),
+      sandbox_mode: (if $sandbox_mode != "" then $sandbox_mode else null end),
+      stop_hook_active: $stop_hook_active
+    }'
+}
+
+matches_event() {
+  local matcher="$1"
+  local event="$2"
+  local tool_name="$3"
+
+  if [[ -z "$matcher" || "$matcher" == "*" ]]; then
+    return 0
+  fi
+
+  local target="$event"
+  if [[ -n "$tool_name" ]]; then
+    target="$tool_name"
+  fi
+
+  echo "$target" | grep -Eq "$matcher"
+}
+
+run_command_hook() {
+  local command="$1"
+  local timeout="$2"
+  local input_json="$3"
+  local output exit_code
+
+  [[ -z "$command" || "$command" == "null" ]] && return 0
+
+  output=$(printf '%s' "$input_json" | run_with_timeout "$timeout" bash -c "$command" 2>&1) || exit_code=$?
+  exit_code=${exit_code:-0}
+
+  if [[ $exit_code -eq 2 ]]; then
+    echo "$output" >&2
+    HOOK_BLOCK_MESSAGE="$output"
+    return 2
+  fi
+
+  if [[ $exit_code -ne 0 ]]; then
+    echo "$output" >&2
+    return "$exit_code"
+  fi
+
+  return 0
+}
+
+run_prompt_hook() {
+  local prompt="$1"
+  local input_json="$2"
+
+  [[ -z "$prompt" || "$prompt" == "null" ]] && return 0
+
+  case "$PROMPT_MODE" in
+    skip)
+      return 0
+      ;;
+    print)
+      echo "$prompt" >&2
+      return 0
+      ;;
+  esac
+
+  if ! has_cmd codex; then
+    warn "codex CLI not available; skipping prompt hook"
+    echo "$prompt" >&2
+    return 0
+  fi
+
+  local schema_file output_file
+  schema_file=$(mktemp)
+  output_file=$(mktemp)
+  # shellcheck disable=SC2064
+  trap "rm -f '$schema_file' '$output_file'" RETURN
+
+  cat > "$schema_file" <<'JSON'
+{
+  "type": "object",
+  "properties": {
+    "decision": { "type": "string", "enum": ["allow", "deny", "ask"] },
+    "reason": { "type": "string" },
+    "systemMessage": { "type": "string" }
+  },
+  "required": ["decision", "reason"],
+  "additionalProperties": false
+}
+JSON
+
+  local prompt_payload
+  prompt_payload=$(cat <<EOF
+You are a workflow gate. Evaluate the hook request and return a decision.
+
+Hook instructions:
+$prompt
+
+Context JSON:
+$input_json
+
+Return JSON with fields: decision (allow|deny|ask), reason, systemMessage (optional).
+EOF
+)
+
+  if ! printf '%s' "$prompt_payload" | codex -a never -s read-only exec \
+      --skip-git-repo-check \
+      -C "$PROJECT_ROOT" \
+      --output-schema "$schema_file" \
+      --output-last-message "$output_file" >/dev/null 2>&1; then
+    warn "prompt hook evaluation failed; allowing by default"
+    return 0
+  fi
+
+  if ! jq -e . "$output_file" >/dev/null 2>&1; then
+    warn "prompt hook output not valid JSON; allowing by default"
+    return 0
+  fi
+
+  local decision reason system_message
+  decision=$(jq -r '.decision // empty' "$output_file")
+  reason=$(jq -r '.reason // empty' "$output_file")
+  system_message=$(jq -r '.systemMessage // empty' "$output_file")
+
+  if [[ "$decision" == "deny" || "$decision" == "ask" ]]; then
+    local msg="HOOK BLOCKED: ${reason}"
+    if [[ -n "$system_message" && "$system_message" != "null" ]]; then
+      msg="${msg}\n${system_message}"
+    fi
+    echo -e "$msg" >&2
+    HOOK_BLOCK_MESSAGE="$msg"
+    return 2
+  fi
+
+  return 0
+}
+
+run_event() {
+  local event="$1"
+  local tool_name="${2:-}"
+  local tool_input="${3:-null}"
+  local tool_result="${4:-null}"
+
+  [[ -f "$HOOKS_FILE" ]] || return 0
+
+  local entries_json
+  entries_json=$(jq -c --arg event "$event" '
+    if has("hooks") then
+      .hooks[$event] // []
+    else
+      .[$event] // []
+    end' "$HOOKS_FILE" 2>/dev/null || echo "[]")
+
+  entries_json=$(echo "$entries_json" | jq -c 'if type=="array" then . else [.] end' 2>/dev/null || echo "[]")
+
+  mapfile -t entries < <(echo "$entries_json" | jq -c '.[]' 2>/dev/null || true)
+  if [[ ${#entries[@]} -eq 0 ]]; then
+    return 0
+  fi
+
+  local input_json
+  input_json=$(build_hook_input "$event" "$tool_name" "$tool_input" "$tool_result")
+
+  for entry in "${entries[@]}"; do
+    local matcher hooks_json
+    matcher=$(echo "$entry" | jq -r '.matcher // "*"' 2>/dev/null || echo "*")
+    if ! matches_event "$matcher" "$event" "$tool_name"; then
+      continue
+    fi
+
+    hooks_json=$(echo "$entry" | jq -c '.hooks // []' 2>/dev/null || echo "[]")
+    hooks_json=$(echo "$hooks_json" | jq -c 'if type=="array" then . else [.] end' 2>/dev/null || echo "[]")
+    mapfile -t hooks < <(echo "$hooks_json" | jq -c '.[]' 2>/dev/null || true)
+
+    for hook in "${hooks[@]}"; do
+      local hook_type hook_command hook_timeout hook_prompt
+      hook_type=$(echo "$hook" | jq -r '.type // "command"' 2>/dev/null || echo "command")
+
+      case "$hook_type" in
+        command)
+          hook_command=$(echo "$hook" | jq -r '.command // empty' 2>/dev/null || echo "")
+          hook_timeout=$(echo "$hook" | jq -r '.timeout // empty' 2>/dev/null || echo "")
+          run_command_hook "$hook_command" "$hook_timeout" "$input_json" || return $?
+          ;;
+        prompt)
+          hook_prompt=$(echo "$hook" | jq -r '.prompt // empty' 2>/dev/null || echo "")
+          run_prompt_hook "$hook_prompt" "$input_json" || return $?
+          ;;
+        *)
+          warn "Unknown hook type: $hook_type"
+          ;;
+      esac
+    done
+  done
+
+  return 0
+}
+
+write_block_message() {
+  local msg="$1"
+  [[ -z "$msg" ]] && return 0
+  mkdir -p "$(dirname "$CODEX_HOOK_BLOCK_FILE")" 2>/dev/null || true
+  printf '%s\n' "$msg" > "$CODEX_HOOK_BLOCK_FILE" 2>/dev/null || true
+}
+
+if ! run_event "SessionStart" "" "null" "null"; then
+  hook_status=$?
+  if [[ $hook_status -eq 2 ]]; then
+    write_block_message "$HOOK_BLOCK_MESSAGE"
+    exit 2
+  fi
+fi
+
+HOOK_BLOCKED=0
+
+extract_tool_name() {
+  jq -r '
+    .tool_name? //
+    .tool?.name? //
+    .tool_call?.name? //
+    .tool_call?.function?.name? //
+    .toolCall?.name? //
+    .toolCall?.function?.name? //
+    empty' 2>/dev/null
+}
+
+extract_tool_input_raw() {
+  jq -c '
+    .tool_input? //
+    .tool?.input? //
+    .tool_call?.arguments? //
+    .tool_call?.function?.arguments? //
+    .toolCall?.arguments? //
+    .toolCall?.function?.arguments? //
+    empty' 2>/dev/null
+}
+
+extract_tool_result_raw() {
+  jq -c '
+    .tool_result? //
+    .tool?.output? //
+    .tool_result?.output? //
+    empty' 2>/dev/null
+}
+
+coproc CODEX_PROC { codex "${EXEC_ARGS[@]}"; }
+CODEX_PID=$!
+
+while IFS= read -r line <&"${CODEX_PROC[0]}"; do
+  [[ -z "$line" ]] && continue
+  printf '%s\n' "$line" >> "$TRANSCRIPT_PATH" 2>/dev/null || true
+
+  if ! echo "$line" | jq -e . >/dev/null 2>&1; then
+    printf '%s\n' "$line"
+    continue
+  fi
+
+  new_session_id=$(echo "$line" | jq -r '.session_id // .session?.id // .sessionId // empty' 2>/dev/null || echo "")
+  if [[ -n "$new_session_id" && "$new_session_id" != "null" ]]; then
+    SESSION_ID="$new_session_id"
+    export CODEX_SESSION_ID="$SESSION_ID"
+    printf '%s\n' "$SESSION_ID" > "$CODEX_SESSION_MARKER" 2>/dev/null || true
+  fi
+
+  tool_name=$(echo "$line" | extract_tool_name | head -n 1 || true)
+  tool_input_raw=$(echo "$line" | extract_tool_input_raw || true)
+  tool_result_raw=$(echo "$line" | extract_tool_result_raw || true)
+
+  if [[ -n "$tool_result_raw" && "$tool_result_raw" != "null" ]]; then
+    tool_result_json=$(normalize_json "$tool_result_raw")
+    tool_input_json="null"
+    if [[ -n "$tool_input_raw" && "$tool_input_raw" != "null" ]]; then
+      tool_input_json=$(normalize_json "$tool_input_raw")
+    fi
+    if run_event "PostToolUse" "$tool_name" "$tool_input_json" "$tool_result_json"; then
+      :
+    else
+      hook_status=$?
+      if [[ $hook_status -eq 2 ]]; then
+        HOOK_BLOCKED=1
+        write_block_message "$HOOK_BLOCK_MESSAGE"
+        kill -TERM "$CODEX_PID" 2>/dev/null || true
+        break
+      fi
+    fi
+    printf '%s\n' "$line"
+    continue
+  fi
+
+  if [[ -n "$tool_input_raw" && "$tool_input_raw" != "null" ]]; then
+    tool_input_json=$(normalize_json "$tool_input_raw")
+    if run_event "PreToolUse" "$tool_name" "$tool_input_json" "null"; then
+      :
+    else
+      hook_status=$?
+      if [[ $hook_status -eq 2 ]]; then
+        HOOK_BLOCKED=1
+        write_block_message "$HOOK_BLOCK_MESSAGE"
+        kill -TERM "$CODEX_PID" 2>/dev/null || true
+        break
+      fi
+    fi
+    printf '%s\n' "$line"
+    continue
+  fi
+
+  printf '%s\n' "$line"
+done
+
+wait "$CODEX_PID" || CODEX_EXIT=$?
+CODEX_EXIT=${CODEX_EXIT:-0}
+
+if [[ "$HOOK_BLOCKED" -eq 1 ]]; then
+  exit 2
+fi
+
+if ! run_event "Stop" "" "null" "null"; then
+  hook_status=$?
+  if [[ $hook_status -eq 2 ]]; then
+    write_block_message "$HOOK_BLOCK_MESSAGE"
+    exit 2
+  fi
+fi
+
+run_event "SessionEnd" "" "null" "null" || true
+
+exit "$CODEX_EXIT"

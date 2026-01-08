@@ -1,0 +1,611 @@
+#!/usr/bin/env bash
+#
+# codex-account - Manage multiple Codex auth profiles via .env (and switch without re-login)
+#
+# Commands:
+#   capture             Save current Codex auth.json into .env
+#   list                Show all saved accounts
+#   list --available    Show only accounts not exhausted/in cooldown
+#   current             Show current active account (from auth.json)
+#   switch              Rotate to next available account
+#   switch <email>      Switch to a specific account
+#   remove [-f] <email> Remove a saved account from .env
+#   next                Print next available account (for scripts)
+#   mark-exhausted      Mark current account as exhausted (rate/plan limit)
+#   reset-exhausted     Reset all exhaustion statuses
+#   is-exhausted        Exit 0 if current account is exhausted, 1 otherwise
+#   status              Show exhaustion status for all accounts
+#   version, -v         Show version information
+#
+# Environment Variables:
+#   CODEX_ENV_FILE                  Path to .env file (default: ./.env)
+#   CODEX_HOME                      Codex home directory (default: ~/.codex)
+#   CODEX_ACCOUNT_COOLDOWN_MINUTES  Cooldown after exhaustion (default: 5)
+#
+# Storage Format in .env:
+#   CODEX_ACCOUNT_<EMAIL>_EMAILADDRESS="user@example.com"
+#   CODEX_ACCOUNT_<EMAIL>_AUTHJSON_B64="eyJ...."   (base64 of $CODEX_HOME/auth.json)
+#
+# Notes:
+# - This script treats the entire auth.json as the portable credential blob.
+# - Switching overwrites $CODEX_HOME/auth.json; restart Codex sessions after switching.
+#
+
+set -euo pipefail
+
+VERSION="1.0.0"
+
+# Colors
+RED='\033[0;31m'
+GREEN='\033[0;32m'
+YELLOW='\033[1;33m'
+BLUE='\033[0;34m'
+BOLD='\033[1m'
+NC='\033[0m'
+
+CODEX_HOME="${CODEX_HOME:-${HOME}/.codex}"
+AUTH_FILE="${CODEX_HOME}/auth.json"
+ENV_FILE="${CODEX_ENV_FILE:-./.env}"
+EXHAUSTION_FILE="${CODEX_HOME}/.account-exhaustion.json"
+COOLDOWN_MINUTES="${CODEX_ACCOUNT_COOLDOWN_MINUTES:-5}"
+
+usage() {
+  awk '
+    NR==1 && /^#!/ { next }
+    /^#/ { sub(/^# ?/, ""); print; next }
+    { exit }
+  ' "$0"
+}
+
+has_cmd() { command -v "$1" >/dev/null 2>&1; }
+
+die() {
+  echo -e "${RED}Error:${NC} $*" >&2
+  exit 1
+}
+
+info() { echo -e "${BLUE}[INFO]${NC} $*" >&2; }
+ok() { echo -e "${GREEN}[OK]${NC} $*" >&2; }
+warn() { echo -e "${YELLOW}[WARN]${NC} $*" >&2; }
+
+ensure_deps() {
+  local missing=()
+  has_cmd jq || missing+=("jq")
+  has_cmd base64 || missing+=("base64")
+  if [[ ${#missing[@]} -gt 0 ]]; then
+    die "Missing required dependencies: ${missing[*]}"
+  fi
+}
+
+mkdir_secure() {
+  local dir="$1"
+  mkdir -p "$dir"
+  chmod 700 "$dir" 2>/dev/null || true
+}
+
+ensure_env_file() {
+  if [[ ! -f "$ENV_FILE" ]]; then
+    mkdir -p "$(dirname "$ENV_FILE")" 2>/dev/null || true
+    : > "$ENV_FILE"
+    chmod 600 "$ENV_FILE" 2>/dev/null || true
+  fi
+}
+
+escape_env_value() {
+  local v="$1"
+  v=${v//\\/\\\\}
+  v=${v//\"/\\\"}
+  echo "$v"
+}
+
+upsert_env_kv() {
+  local key="$1"
+  local value="$2"
+  ensure_env_file
+  local tmp
+  tmp=$(mktemp)
+  # shellcheck disable=SC2064
+  trap "rm -f '$tmp'" RETURN
+
+  if [[ -s "$ENV_FILE" ]]; then
+    # Remove existing key definitions (keep comments/blank lines)
+    grep -vE "^${key}=" "$ENV_FILE" > "$tmp" || true
+  fi
+
+  printf '%s="%s"\n' "$key" "$(escape_env_value "$value")" >> "$tmp"
+  mv "$tmp" "$ENV_FILE"
+  chmod 600 "$ENV_FILE" 2>/dev/null || true
+}
+
+delete_env_key_prefix() {
+  local prefix="$1"
+  ensure_env_file
+  local tmp
+  tmp=$(mktemp)
+  # shellcheck disable=SC2064
+  trap "rm -f '$tmp'" RETURN
+
+  if [[ -s "$ENV_FILE" ]]; then
+    grep -vE "^${prefix}" "$ENV_FILE" > "$tmp" || true
+  fi
+  mv "$tmp" "$ENV_FILE"
+  chmod 600 "$ENV_FILE" 2>/dev/null || true
+}
+
+get_env_value() {
+  local key="$1"
+  if [[ ! -f "$ENV_FILE" ]]; then
+    echo ""
+    return 0
+  fi
+  local line
+  line=$(grep -E "^${key}=" "$ENV_FILE" | tail -n 1 || true)
+  [[ -z "$line" ]] && { echo ""; return 0; }
+  local value="${line#*=}"
+  value=$(echo "$value" | sed -e 's/^"//' -e 's/"$//' -e "s/^'//" -e "s/'$//")
+  # Unescape common sequences
+  value=${value//\\\"/\"}
+  value=${value//\\\\/\\}
+  echo "$value"
+}
+
+base64_encode_one_line() {
+  if base64 --help 2>/dev/null | grep -q -- '-w'; then
+    base64 -w 0
+  elif base64 --help 2>/dev/null | grep -q -- '--wrap'; then
+    base64 --wrap=0
+  elif base64 --help 2>/dev/null | grep -q -- '-b'; then
+    base64 -b 0
+  else
+    base64 | tr -d '\n'
+  fi
+}
+
+base64_decode() {
+  if base64 --help 2>/dev/null | grep -q -- '--decode'; then
+    base64 --decode
+  elif base64 --help 2>/dev/null | grep -q -- ' -d'; then
+    base64 -d
+  else
+    base64 -D
+  fi
+}
+
+jwt_payload_json() {
+  local jwt="$1"
+  [[ -z "$jwt" ]] && { echo ""; return 1; }
+  local payload
+  payload=$(echo "$jwt" | awk -F. '{print $2}')
+  [[ -z "$payload" ]] && { echo ""; return 1; }
+  payload=$(echo "$payload" | tr '_-' '/+')
+
+  local mod=$(( ${#payload} % 4 ))
+  if [[ $mod -eq 2 ]]; then
+    payload="${payload}=="
+  elif [[ $mod -eq 3 ]]; then
+    payload="${payload}="
+  elif [[ $mod -eq 1 ]]; then
+    echo ""
+    return 1
+  fi
+
+  echo "$payload" | base64_decode 2>/dev/null || echo ""
+}
+
+get_current_email() {
+  if [[ ! -f "$AUTH_FILE" ]]; then
+    echo ""
+    return 0
+  fi
+
+  local id_token
+  id_token=$(jq -r '.tokens.id_token // empty' "$AUTH_FILE" 2>/dev/null || echo "")
+  if [[ -z "$id_token" ]]; then
+    echo ""
+    return 0
+  fi
+
+  local payload
+  payload=$(jwt_payload_json "$id_token")
+  if [[ -z "$payload" ]]; then
+    echo ""
+    return 0
+  fi
+
+  # Prefer top-level "email"; fall back to OpenAI profile claim
+  echo "$payload" | jq -r '.email // ."https://api.openai.com/profile".email // empty' 2>/dev/null || echo ""
+}
+
+sanitize_email() {
+  local email="$1"
+  echo "$email" | sed 's/[^a-zA-Z0-9]/_/g' | tr '[:lower:]' '[:upper:]'
+}
+
+list_account_emails() {
+  if [[ ! -f "$ENV_FILE" ]]; then
+    return 0
+  fi
+  grep -E '^CODEX_ACCOUNT_[A-Z0-9_]+_EMAILADDRESS=' "$ENV_FILE" | \
+    sed -E 's/^CODEX_ACCOUNT_[A-Z0-9_]+_EMAILADDRESS=//' | \
+    sed -e 's/^"//' -e 's/"$//' -e "s/^'//" -e "s/'$//" || true
+}
+
+init_exhaustion_file() {
+  mkdir_secure "$CODEX_HOME"
+  if [[ ! -f "$EXHAUSTION_FILE" ]]; then
+    cat >"$EXHAUSTION_FILE" <<EOF
+{
+  "exhausted": {},
+  "cooldown_minutes": ${COOLDOWN_MINUTES}
+}
+EOF
+    chmod 600 "$EXHAUSTION_FILE" 2>/dev/null || true
+  fi
+}
+
+get_exhausted_at() {
+  local email="$1"
+  [[ -f "$EXHAUSTION_FILE" ]] || { echo ""; return 0; }
+  jq -r --arg email "$email" '.exhausted[$email] // empty' "$EXHAUSTION_FILE" 2>/dev/null || echo ""
+}
+
+is_available() {
+  local email="$1"
+  local exhausted_at
+  exhausted_at=$(get_exhausted_at "$email")
+  [[ -z "$exhausted_at" || "$exhausted_at" == "null" ]] && return 0
+
+  local now
+  now=$(date +%s)
+  local cooldown=$(( COOLDOWN_MINUTES * 60 ))
+  if (( now - exhausted_at >= cooldown )); then
+    return 0
+  fi
+  return 1
+}
+
+mark_exhausted() {
+  local email="$1"
+  [[ -z "$email" ]] && return 0
+  init_exhaustion_file
+  local now
+  now=$(date +%s)
+
+  local tmp
+  tmp=$(mktemp)
+  # shellcheck disable=SC2064
+  trap "rm -f '$tmp'" RETURN
+
+  if jq --arg email "$email" --argjson ts "$now" \
+    '.exhausted[$email] = $ts | .cooldown_minutes = (.cooldown_minutes // 5)' \
+    "$EXHAUSTION_FILE" > "$tmp" 2>/dev/null; then
+    mv "$tmp" "$EXHAUSTION_FILE"
+    chmod 600 "$EXHAUSTION_FILE" 2>/dev/null || true
+  fi
+}
+
+reset_exhausted() {
+  init_exhaustion_file
+  local tmp
+  tmp=$(mktemp)
+  # shellcheck disable=SC2064
+  trap "rm -f '$tmp'" RETURN
+
+  if jq '.exhausted = {}' "$EXHAUSTION_FILE" > "$tmp" 2>/dev/null; then
+    mv "$tmp" "$EXHAUSTION_FILE"
+    chmod 600 "$EXHAUSTION_FILE" 2>/dev/null || true
+  fi
+}
+
+next_available_account() {
+  ensure_env_file
+
+  local current_email
+  current_email=$(get_current_email)
+
+  local -a accounts=()
+  local email
+  while IFS= read -r email; do
+    [[ -n "$email" ]] && accounts+=("$email")
+  done < <(list_account_emails)
+
+  [[ ${#accounts[@]} -eq 0 ]] && return 1
+
+  local start_idx=0
+  if [[ -n "$current_email" ]]; then
+    local i
+    for i in "${!accounts[@]}"; do
+      if [[ "${accounts[$i]}" == "$current_email" ]]; then
+        start_idx=$(( (i + 1) % ${#accounts[@]} ))
+        break
+      fi
+    done
+  fi
+
+  local n=${#accounts[@]}
+  local offset
+  for ((offset=0; offset<n; offset++)); do
+    local idx=$(( (start_idx + offset) % n ))
+    local candidate="${accounts[$idx]}"
+    if is_available "$candidate"; then
+      echo "$candidate"
+      return 0
+    fi
+  done
+
+  return 1
+}
+
+restore_account_to_auth_file() {
+  local email="$1"
+  local sanitized
+  sanitized=$(sanitize_email "$email")
+
+  local b64_key="CODEX_ACCOUNT_${sanitized}_AUTHJSON_B64"
+  local b64
+  b64=$(get_env_value "$b64_key")
+  [[ -z "$b64" ]] && die "No stored auth for $email (missing $b64_key in $ENV_FILE)"
+
+  mkdir_secure "$CODEX_HOME"
+
+  local tmp
+  tmp=$(mktemp)
+  # shellcheck disable=SC2064
+  trap "rm -f '$tmp'" RETURN
+
+  echo "$b64" | base64_decode > "$tmp" 2>/dev/null || die "Failed to decode stored auth for $email"
+  jq empty "$tmp" >/dev/null 2>&1 || die "Decoded auth for $email is not valid JSON"
+
+  mv "$tmp" "$AUTH_FILE"
+  chmod 600 "$AUTH_FILE" 2>/dev/null || true
+}
+
+cmd_capture() {
+  ensure_deps
+  ensure_env_file
+
+  [[ -f "$AUTH_FILE" ]] || die "No auth found at $AUTH_FILE. Run 'codex login' first."
+
+  local email
+  email=$(get_current_email)
+  [[ -n "$email" ]] || die "Could not determine current account email from $AUTH_FILE"
+
+  local sanitized
+  sanitized=$(sanitize_email "$email")
+
+  local auth_b64
+  auth_b64=$(base64_encode_one_line < "$AUTH_FILE")
+
+  upsert_env_kv "CODEX_ACCOUNT_${sanitized}_EMAILADDRESS" "$email"
+  upsert_env_kv "CODEX_ACCOUNT_${sanitized}_AUTHJSON_B64" "$auth_b64"
+
+  ok "Captured account: $email"
+  echo "$email"
+}
+
+cmd_list() {
+  ensure_deps
+  ensure_env_file
+
+  local only_available="${1:-false}"
+  init_exhaustion_file
+
+  local -a emails=()
+  local email
+  while IFS= read -r email; do
+    [[ -n "$email" ]] && emails+=("$email")
+  done < <(list_account_emails)
+
+  if [[ ${#emails[@]} -eq 0 ]]; then
+    echo "No accounts saved in $ENV_FILE"
+    return 0
+  fi
+
+  if [[ "$only_available" == "true" ]]; then
+    for email in "${emails[@]}"; do
+      if is_available "$email"; then
+        echo "$email"
+      fi
+    done
+    return 0
+  fi
+
+  echo -e "${BOLD}Saved Codex accounts:${NC}"
+  local current
+  current=$(get_current_email || true)
+  for email in "${emails[@]}"; do
+    local marker=" "
+    [[ -n "$current" && "$email" == "$current" ]] && marker="*"
+    if is_available "$email"; then
+      echo "  ${marker} ${email}"
+    else
+      local exhausted_at
+      exhausted_at=$(get_exhausted_at "$email")
+      local now
+      now=$(date +%s)
+      local cooldown=$(( COOLDOWN_MINUTES * 60 ))
+      local remaining=$(( cooldown - (now - exhausted_at) ))
+      [[ $remaining -lt 0 ]] && remaining=0
+      echo "  ${marker} ${email} (cooldown ${remaining}s)"
+    fi
+  done
+  echo ""
+  echo "Total: ${#emails[@]} account(s)"
+}
+
+cmd_current() {
+  ensure_deps
+  local email
+  email=$(get_current_email)
+  if [[ -z "$email" ]]; then
+    echo "No active Codex account detected (missing id_token email)"
+    return 1
+  fi
+  echo "$email"
+}
+
+cmd_next() {
+  ensure_deps
+  local next
+  if next=$(next_available_account); then
+    echo "$next"
+    return 0
+  fi
+  return 1
+}
+
+cmd_switch() {
+  ensure_deps
+  ensure_env_file
+  init_exhaustion_file
+
+  local target="${1:-}"
+  if [[ -z "$target" ]]; then
+    target=$(next_available_account) || die "No available accounts (all exhausted or none captured)"
+  fi
+
+  restore_account_to_auth_file "$target"
+  ok "Switched active Codex auth to: $target"
+  echo "$target"
+}
+
+cmd_remove() {
+  ensure_deps
+  ensure_env_file
+  init_exhaustion_file
+
+  local force=false
+  if [[ "${1:-}" == "-f" ]]; then
+    force=true
+    shift
+  fi
+
+  local email="${1:-}"
+  [[ -n "$email" ]] || die "remove requires an email"
+
+  local sanitized
+  sanitized=$(sanitize_email "$email")
+
+  local email_key="CODEX_ACCOUNT_${sanitized}_EMAILADDRESS"
+  local existing
+  existing=$(get_env_value "$email_key")
+  if [[ -z "$existing" && "$force" != "true" ]]; then
+    die "Account not found in $ENV_FILE: $email"
+  fi
+
+  delete_env_key_prefix "CODEX_ACCOUNT_${sanitized}_"
+
+  # Remove from exhaustion file
+  local tmp
+  tmp=$(mktemp)
+  # shellcheck disable=SC2064
+  trap "rm -f '$tmp'" RETURN
+  if jq --arg email "$email" 'del(.exhausted[$email])' "$EXHAUSTION_FILE" > "$tmp" 2>/dev/null; then
+    mv "$tmp" "$EXHAUSTION_FILE"
+    chmod 600 "$EXHAUSTION_FILE" 2>/dev/null || true
+  fi
+
+  ok "Removed: $email"
+}
+
+cmd_mark_exhausted() {
+  ensure_deps
+  local email
+  email=$(get_current_email)
+  [[ -n "$email" ]] || die "No current account detected to mark exhausted"
+  mark_exhausted "$email"
+  ok "Marked exhausted: $email"
+  echo "$email"
+}
+
+cmd_reset_exhausted() {
+  ensure_deps
+  reset_exhausted
+  ok "Reset exhaustion statuses"
+}
+
+cmd_is_exhausted() {
+  ensure_deps
+  local email
+  email=$(get_current_email)
+  [[ -n "$email" ]] || exit 1
+  if is_available "$email"; then
+    exit 1
+  fi
+  exit 0
+}
+
+cmd_status() {
+  ensure_deps
+  ensure_env_file
+  init_exhaustion_file
+
+  local -a emails=()
+  local email
+  while IFS= read -r email; do
+    [[ -n "$email" ]] && emails+=("$email")
+  done < <(list_account_emails)
+
+  if [[ ${#emails[@]} -eq 0 ]]; then
+    echo "No accounts saved in $ENV_FILE"
+    return 0
+  fi
+
+  local current
+  current=$(get_current_email || true)
+
+  echo -e "${BOLD}Codex account status:${NC}"
+  for email in "${emails[@]}"; do
+    local marker=" "
+    [[ -n "$current" && "$email" == "$current" ]] && marker="*"
+
+    if is_available "$email"; then
+      echo "  ${marker} ${email}  ${GREEN}available${NC}"
+    else
+      local exhausted_at
+      exhausted_at=$(get_exhausted_at "$email")
+      local now
+      now=$(date +%s)
+      local cooldown=$(( COOLDOWN_MINUTES * 60 ))
+      local remaining=$(( cooldown - (now - exhausted_at) ))
+      [[ $remaining -lt 0 ]] && remaining=0
+      echo "  ${marker} ${email}  ${YELLOW}cooldown${NC} (${remaining}s)"
+    fi
+  done
+}
+
+main() {
+  local cmd="${1:-help}"
+  shift || true
+
+  case "$cmd" in
+    capture) cmd_capture "$@" ;;
+    list)
+      if [[ "${1:-}" == "--available" ]]; then
+        cmd_list true
+      else
+        cmd_list false
+      fi
+      ;;
+    current) cmd_current ;;
+    next) cmd_next ;;
+    switch) cmd_switch "${1:-}" ;;
+    remove) cmd_remove "$@" ;;
+    mark-exhausted) cmd_mark_exhausted ;;
+    reset-exhausted) cmd_reset_exhausted ;;
+    is-exhausted) cmd_is_exhausted ;;
+    status) cmd_status ;;
+    version|-v|--version)
+      echo "codex-account version ${VERSION}"
+      ;;
+    help|-h|--help)
+      usage
+      ;;
+    *)
+      usage >&2
+      die "Unknown command: $cmd"
+      ;;
+  esac
+}
+
+main "$@"

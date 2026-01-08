@@ -1,0 +1,215 @@
+#!/usr/bin/env bash
+#
+# codex-subagent - Run a Codex agent card as a subagent
+#
+# Usage:
+#   codex-subagent <agent-name> [-- <context text>]
+#   codex-subagent --path <agent-file> [-- <context text>]
+#   codex-subagent --list
+#
+# Options:
+#   --profile <name>   Override profile from agent card
+#   --model <model>    Override model from agent card
+#   --path <path>      Use explicit agent card path
+#   --list             List available agent cards
+#   -h, --help         Show help
+#
+# Environment:
+#   CODEX_AGENT_PATHS   Colon-separated agent search paths
+#   CODEX_SUBAGENT_FLAGS Extra flags passed to `codex exec` (space-separated)
+#
+
+set -euo pipefail
+
+RED='\033[0;31m'
+YELLOW='\033[1;33m'
+NC='\033[0m'
+
+usage() {
+  awk '
+    NR==1 && /^#!/ { next }
+    /^#/ { sub(/^# ?/, ""); print; next }
+    { exit }
+  ' "$0"
+}
+
+die() { echo -e "${RED}Error:${NC} $*" >&2; exit 1; }
+warn() { echo -e "${YELLOW}[WARN]${NC} $*" >&2; }
+
+has_cmd() { command -v "$1" >/dev/null 2>&1; }
+
+project_root() {
+  if [[ -n "${CODEX_PROJECT_ROOT:-}" ]]; then
+    printf '%s\n' "${CODEX_PROJECT_ROOT}"
+    return
+  fi
+  git rev-parse --show-toplevel 2>/dev/null || pwd
+}
+
+resolve_agent_paths() {
+  local root
+  root="$(project_root)"
+  if [[ -n "${CODEX_AGENT_PATHS:-}" ]]; then
+    IFS=':' read -r -a AGENT_DIRS <<< "${CODEX_AGENT_PATHS}"
+  else
+    AGENT_DIRS=("${root}/agents" "${root}/external/agents")
+  fi
+}
+
+list_agents() {
+  resolve_agent_paths
+  local dir file name
+  shopt -s nullglob
+  for dir in "${AGENT_DIRS[@]}"; do
+    [[ -d "$dir" ]] || continue
+    for file in "${dir}"/*.md; do
+      name="$(basename "${file}" .md)"
+      printf '%s\t%s\n' "${name}" "${file}"
+    done
+  done
+  shopt -u nullglob
+}
+
+extract_frontmatter() {
+  awk 'BEGIN{c=0} /^---$/{c++; next} c==1 {print} c>=2 {exit}' "$1"
+}
+
+extract_body() {
+  awk 'BEGIN{c=0} /^---$/{c++; next} c>=2 {print}' "$1"
+}
+
+trim_quotes() {
+  local val="$1"
+  val="${val#\"}"
+  val="${val%\"}"
+  val="${val#\'}"
+  val="${val%\'}"
+  printf '%s' "${val}"
+}
+
+extract_field() {
+  local key="$1"
+  awk -F': *' -v key="${key}" '$1==key {print $2; exit}'
+}
+
+agent_name=""
+agent_path=""
+profile_override=""
+model_override=""
+
+if [[ $# -eq 0 ]]; then
+  usage
+  exit 1
+fi
+
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+    --list)
+      list_agents
+      exit 0
+      ;;
+    --path)
+      agent_path="${2:-}"
+      shift 2
+      ;;
+    --profile)
+      profile_override="${2:-}"
+      shift 2
+      ;;
+    --model)
+      model_override="${2:-}"
+      shift 2
+      ;;
+    -h|--help)
+      usage
+      exit 0
+      ;;
+    --)
+      shift
+      break
+      ;;
+    *)
+      if [[ -z "$agent_name" ]]; then
+        agent_name="$1"
+        shift
+      else
+        break
+      fi
+      ;;
+  esac
+done
+
+context_args=("$@")
+
+if [[ -z "$agent_path" ]]; then
+  if [[ -z "$agent_name" ]]; then
+    die "Agent name or --path is required"
+  fi
+
+  resolve_agent_paths
+  for dir in "${AGENT_DIRS[@]}"; do
+    if [[ -f "${dir}/${agent_name}.md" ]]; then
+      agent_path="${dir}/${agent_name}.md"
+      break
+    fi
+  done
+fi
+
+if [[ -z "$agent_path" ]]; then
+  die "Agent card not found for '${agent_name}'"
+fi
+
+if [[ ! -f "$agent_path" ]]; then
+  die "Agent card not found at ${agent_path}"
+fi
+
+if ! has_cmd codex; then
+  die "codex CLI not found in PATH"
+fi
+
+frontmatter="$(extract_frontmatter "$agent_path")"
+profile="$(printf '%s\n' "$frontmatter" | extract_field "profile" || true)"
+model="$(printf '%s\n' "$frontmatter" | extract_field "model" || true)"
+
+profile="$(trim_quotes "${profile}")"
+model="$(trim_quotes "${model}")"
+
+agent_body="$(extract_body "$agent_path")"
+
+context=""
+if [[ ! -t 0 ]]; then
+  context="$(cat)"
+fi
+if [[ ${#context_args[@]} -gt 0 ]]; then
+  if [[ -n "$context" ]]; then
+    context="${context}\n\n${context_args[*]}"
+  else
+    context="${context_args[*]}"
+  fi
+fi
+
+prompt="${agent_body}"
+if [[ -n "$context" ]]; then
+  prompt="${prompt}\n\n## Task Context\n${context}\n"
+fi
+
+cmd=(codex exec)
+
+if [[ -n "$profile_override" ]]; then
+  cmd+=("-p" "$profile_override")
+elif [[ -n "$profile" ]]; then
+  cmd+=("-p" "$profile")
+elif [[ -n "$model_override" ]]; then
+  cmd+=("-m" "$model_override")
+elif [[ -n "$model" ]]; then
+  cmd+=("-m" "$model")
+fi
+
+if [[ -n "${CODEX_SUBAGENT_FLAGS:-}" ]]; then
+  read -r -a extra_flags <<< "${CODEX_SUBAGENT_FLAGS}"
+  cmd+=("${extra_flags[@]}")
+fi
+
+cmd+=("-")
+
+printf '%s\n' "$prompt" | "${cmd[@]}"

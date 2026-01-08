@@ -1,0 +1,766 @@
+#!/usr/bin/env bash
+#
+# codex-autonomous - Start autonomous issue-driven development with Codex
+#
+# Usage:
+#   codex-autonomous [OPTIONS]
+#
+# Options:
+#   -e, --epic <N>       Focus on a specific epic/issue number
+#   -n, --new            Bootstrap worktree, then wait for instructions
+#   -c, --continue       Resume the most recent autonomous session
+#   --resume [ID]        Resume a session (worktree id or Codex session UUID). If omitted, shows list
+#   -l, --list           List autonomous session history
+#   -r, --repo <path>    Repository path (default: current directory)
+#   -v, --version        Show version information
+#   -h, --help           Show this help message
+#
+# Environment Variables:
+#   WORK_EPIC                        Same as --epic
+#   GITHUB_PERSONAL_ACCESS_TOKEN     GitHub token for MCP GitHub server (auto-fetched from gh if not set)
+#   GITHUB_TOKEN                     Also exported for compatibility (derived from gh if missing)
+#   MAX_CRASHES                      Maximum crashes before giving up (default: 10)
+#   CODEX_AUTONOMOUS_FLAGS           Extra flags passed to Codex CLI (default: --dangerously-bypass-approvals-and-sandbox)
+#   CODEX_AUTONOMOUS_MAX_SWITCHES    Max account switches per session (default: 10)
+#   CODEX_ACCOUNT_COOLDOWN_MINUTES   Cooldown after account exhaustion (default: 5)
+#   CODEX_DISABLE_HOOKS             Disable hook runner integration (default: false)
+#   CODEX_HOOK_RUNNER               Path to codex-hook-runner (default: scripts/codex-hook-runner or PATH)
+#   CODEX_HOOK_ROOT                  Hook root directory (default: $CODEX_HOME/hooks)
+#   CODEX_HOOK_CONFIG                Path to hooks.json (default: $CODEX_HOOK_ROOT/hooks.json)
+#   CODEX_HOOK_PROMPT_MODE           codex|print|skip (default: codex)
+#   CODEX_HOME                       Codex home directory (default: ~/.codex)
+#
+
+set -euo pipefail
+
+VERSION="1.0.0"
+
+# Colors
+RED='\033[0;31m'
+GREEN='\033[0;32m'
+YELLOW='\033[1;33m'
+BLUE='\033[0;34m'
+CYAN='\033[0;36m'
+NC='\033[0m'
+
+CODEX_HOME="${CODEX_HOME:-${HOME}/.codex}"
+HISTORY_FILE="${CODEX_HOME}/history.jsonl"
+SESSIONS_DIR="${CODEX_HOME}/sessions"
+
+SESSION_LOG="/tmp/codex-sessions.txt"
+WORKTREE_ROOT="/tmp/codex-worktrees"
+
+MAX_CRASHES="${MAX_CRASHES:-10}"
+MAX_ACCOUNT_SWITCHES="${CODEX_AUTONOMOUS_MAX_SWITCHES:-10}"
+HOOKS_ACTIVE=false
+
+DEFAULT_CODEX_FLAGS="${CODEX_AUTONOMOUS_FLAGS:---dangerously-bypass-approvals-and-sandbox}"
+
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+
+has_cmd() { command -v "$1" >/dev/null 2>&1; }
+
+log_info() { echo -e "${BLUE}[INFO]${NC} $*"; }
+log_ok() { echo -e "${GREEN}[OK]${NC} $*"; }
+log_warn() { echo -e "${YELLOW}[WARN]${NC} $*"; }
+log_err() { echo -e "${RED}[ERROR]${NC} $*"; }
+
+die() { log_err "$*"; exit 1; }
+
+check_tool() {
+  local cmd="$1"
+  local hint="$2"
+  if ! has_cmd "$cmd"; then
+    die "$cmd is required but not installed. ${hint}"
+  fi
+}
+
+get_codex_account_cmd() {
+  if [[ -x "${SCRIPT_DIR}/codex-account" ]]; then
+    echo "${SCRIPT_DIR}/codex-account"
+  elif has_cmd codex-account; then
+    echo "codex-account"
+  else
+    echo ""
+  fi
+}
+
+hooks_enabled() {
+  case "${CODEX_DISABLE_HOOKS:-}" in
+    1|true|yes) return 1 ;;
+  esac
+  return 0
+}
+
+resolve_hook_runner() {
+  if [[ -n "${CODEX_HOOK_RUNNER:-}" && -x "${CODEX_HOOK_RUNNER}" ]]; then
+    echo "${CODEX_HOOK_RUNNER}"
+  elif [[ -x "${SCRIPT_DIR}/codex-hook-runner" ]]; then
+    echo "${SCRIPT_DIR}/codex-hook-runner"
+  elif has_cmd codex-hook-runner; then
+    echo "codex-hook-runner"
+  else
+    echo ""
+  fi
+}
+
+hook_block_file_for_session() {
+  local session_id="$1"
+  local codex_home="${CODEX_HOME:-${HOME}/.codex}"
+  echo "${codex_home}/.hook-block.${session_id}"
+}
+
+handle_hook_account_state() {
+  local session_id="$1"
+  local codex_home="${CODEX_HOME:-${HOME}/.codex}"
+  local suffix=".${session_id}"
+  local switch_file="${codex_home}/.pending-account-switch${suffix}"
+  local sleep_file="${codex_home}/.account-sleep-mode${suffix}"
+
+  if [[ -f "$switch_file" ]]; then
+    local next_account
+    next_account=$(jq -r '.to // empty' "$switch_file" 2>/dev/null || echo "")
+    rm -f "$switch_file" 2>/dev/null || true
+    if [[ -n "$next_account" ]]; then
+      echo "Account switched to ${next_account}. Resume work without repeating the failed request."
+    else
+      echo "Account switched. Resume work without repeating the failed request."
+    fi
+    return 0
+  fi
+
+  if [[ -f "$sleep_file" ]]; then
+    local cooldown
+    cooldown=$(jq -r '.cooldown_minutes // empty' "$sleep_file" 2>/dev/null || echo "")
+    rm -f "$sleep_file" 2>/dev/null || true
+    if [[ -n "$cooldown" ]]; then
+      CODEX_ACCOUNT_COOLDOWN_MINUTES="$cooldown"
+    fi
+    wait_for_account_cooldown
+    echo "All accounts were exhausted. Cooldown complete; resume work carefully."
+    return 0
+  fi
+
+  return 1
+}
+
+ensure_session_log() {
+  mkdir -p "$(dirname "$SESSION_LOG")" 2>/dev/null || true
+  touch "$SESSION_LOG" 2>/dev/null || true
+  chmod 600 "$SESSION_LOG" 2>/dev/null || true
+}
+
+uuid() {
+  uuidgen 2>/dev/null || cat /proc/sys/kernel/random/uuid 2>/dev/null || echo "$(date +%s)-${RANDOM}-${RANDOM}"
+}
+
+count_lines() {
+  local f="$1"
+  if [[ -f "$f" ]]; then
+    wc -l < "$f" | tr -d ' '
+  else
+    echo "0"
+  fi
+}
+
+discover_new_session_id() {
+  local before_lines="$1"
+  local after_lines
+  after_lines=$(count_lines "$HISTORY_FILE")
+  if [[ "$after_lines" -le "$before_lines" ]]; then
+    echo ""
+    return 1
+  fi
+  # Take the first new history line appended after before_lines
+  local line
+  line=$(sed -n "$((before_lines + 1))p" "$HISTORY_FILE" 2>/dev/null || true)
+  [[ -z "$line" ]] && { echo ""; return 1; }
+  echo "$line" | jq -r '.session_id // empty' 2>/dev/null || echo ""
+}
+
+find_session_file() {
+  local session_id="$1"
+  [[ -z "$session_id" ]] && return 1
+  [[ -d "$SESSIONS_DIR" ]] || return 1
+  # Codex stores sessions under YYYY/MM/DD/*.jsonl with the session UUID in the filename.
+  find "$SESSIONS_DIR" -type f -name "*${session_id}.jsonl" 2>/dev/null | head -n 1
+}
+
+detect_plan_limit_in_transcript() {
+  local transcript="$1"
+  [[ -f "$transcript" ]] || return 1
+
+  local patterns=(
+    "rate.?limit"
+    "quota"
+    "too.?many.?requests"
+    "429"
+    "capacity"
+    "try.?again.?later"
+    "insufficient_quota"
+    "billing"
+    "plan.?limit"
+  )
+
+  local combined=""
+  local p
+  for p in "${patterns[@]}"; do
+    [[ -n "$combined" ]] && combined="${combined}|"
+    combined="${combined}${p}"
+  done
+
+  tail -200 "$transcript" 2>/dev/null | grep -qiE "$combined"
+}
+
+try_switch_account() {
+  local cmd
+  cmd=$(get_codex_account_cmd)
+  [[ -n "$cmd" ]] || return 1
+
+  if ! next=$("$cmd" next 2>/dev/null); then
+    return 2
+  fi
+
+  "$cmd" mark-exhausted >/dev/null 2>&1 || true
+  "$cmd" switch "$next" >/dev/null 2>&1 || return 1
+  echo "$next"
+  return 0
+}
+
+wait_for_account_cooldown() {
+  local cooldown_minutes="${CODEX_ACCOUNT_COOLDOWN_MINUTES:-5}"
+  local seconds=$((cooldown_minutes * 60))
+  log_warn "All accounts exhausted. Waiting ${cooldown_minutes} minutes for cooldown..."
+
+  while [[ $seconds -gt 0 ]]; do
+    local mins=$((seconds / 60))
+    local secs=$((seconds % 60))
+    printf "\r${BLUE}Resuming in: %02d:%02d${NC}  " "$mins" "$secs"
+    sleep 1
+    ((seconds--))
+  done
+  echo ""
+
+  local cmd
+  cmd=$(get_codex_account_cmd)
+  if [[ -n "$cmd" ]]; then
+    "$cmd" reset-exhausted >/dev/null 2>&1 || true
+  fi
+}
+
+get_session_info_by_id() {
+  local id="$1"
+  [[ -f "$SESSION_LOG" ]] || return 1
+  grep " ${id} " "$SESSION_LOG" | tail -n 1
+}
+
+get_latest_session_line() {
+  [[ -f "$SESSION_LOG" ]] || return 1
+  tail -n 1 "$SESSION_LOG"
+}
+
+list_sessions() {
+  ensure_session_log
+  echo -e "${CYAN}Autonomous Session History:${NC}"
+  echo ""
+  if [[ ! -s "$SESSION_LOG" ]]; then
+    echo "  No sessions recorded yet."
+    return 0
+  fi
+
+  echo -e "  ${BLUE}WORKTREE ID                          CODEX SESSION                        REPO           STATUS${NC}"
+  echo -e "  ─────────────────────────────────────────────────────────────────────────────────────────────────────"
+
+  tail -20 "$SESSION_LOG" | tac | while read -r line; do
+    [[ -z "$line" ]] && continue
+    local worktree_id codex_sid repo details
+    worktree_id=$(echo "$line" | awk '{print $2}')
+    codex_sid=$(echo "$line" | awk '{print $3}')
+    repo=$(echo "$line" | awk '{print $4}')
+
+    local status="${RED}no session${NC}"
+    local sf
+    sf=$(find_session_file "$codex_sid" || true)
+    [[ -n "$sf" ]] && status="${GREEN}resumable${NC}"
+
+    printf "  %-36s %-36s %-14s %s\n" "$worktree_id" "$codex_sid" "$repo" "$status"
+  done
+
+  echo ""
+  echo -e "${YELLOW}To resume:${NC}"
+  echo -e "  Most recent:  ${CYAN}codex-autonomous --continue${NC}"
+  echo -e "  By worktree:  ${CYAN}codex-autonomous --resume <worktree-id>${NC}"
+  echo -e "  By session:   ${CYAN}codex-autonomous --resume <codex-session-uuid>${NC}"
+}
+
+parse_default_branch() {
+  local b
+  b=$(git remote show origin 2>/dev/null | grep 'HEAD branch' | cut -d: -f2 | tr -d ' ' || true)
+  if [[ -n "$b" ]]; then
+    echo "$b"
+    return 0
+  fi
+  if git rev-parse --verify origin/main >/dev/null 2>&1; then
+    echo "main"
+    return 0
+  fi
+  if git rev-parse --verify origin/master >/dev/null 2>&1; then
+    echo "master"
+    return 0
+  fi
+  echo "main"
+}
+
+ensure_github_token() {
+  if [[ -z "${GITHUB_PERSONAL_ACCESS_TOKEN:-}" ]]; then
+    log_warn "GITHUB_PERSONAL_ACCESS_TOKEN not set, fetching from gh CLI..."
+    local token
+    token=$(gh auth token 2>/dev/null || true)
+    [[ -n "$token" ]] || die "Could not fetch GitHub token from gh. Run: gh auth login"
+    export GITHUB_PERSONAL_ACCESS_TOKEN="$token"
+    log_ok "GITHUB_PERSONAL_ACCESS_TOKEN set from gh auth token"
+  fi
+
+  if [[ -z "${GITHUB_TOKEN:-}" ]]; then
+    export GITHUB_TOKEN="$GITHUB_PERSONAL_ACCESS_TOKEN"
+  fi
+}
+
+run_codex_session() {
+  local mode="$1"               # new|resume
+  local worktree_dir="$2"
+  local prompt="${3:-}"
+  local codex_session_id="${4:-}"
+  local before_lines="$5"
+
+  local -a flags=()
+  # shellcheck disable=SC2206
+  flags=(${DEFAULT_CODEX_FLAGS})
+
+  local exit_code=0
+  local use_hooks=false
+  local hook_runner=""
+  local hook_transcript=""
+  local hook_root=""
+  local hook_config=""
+  HOOKS_ACTIVE=false
+
+  if hooks_enabled; then
+    export CODEX_HOOKS=1
+    hook_runner=$(resolve_hook_runner)
+    if [[ -n "$hook_runner" ]]; then
+      use_hooks=true
+      HOOKS_ACTIVE=true
+      hook_root="${CODEX_HOOK_ROOT:-${CODEX_HOME}/hooks}"
+      hook_config="${CODEX_HOOK_CONFIG:-${hook_root}/hooks.json}"
+      hook_transcript="${CODEX_HOOK_TRANSCRIPT:-${CODEX_HOME}/logs/hook-${CODEX_AUTONOMOUS_SESSION_ID:-session}.jsonl}"
+      mkdir -p "$(dirname "$hook_transcript")" 2>/dev/null || true
+      export CODEX_HOOK_ROOT="$hook_root"
+      export CODEX_HOOK_CONFIG="$hook_config"
+      export CODEX_PROJECT_ROOT="$worktree_dir"
+      CODEX_HOOK_BLOCK_FILE="$(hook_block_file_for_session "${CODEX_AUTONOMOUS_SESSION_ID:-session}")"
+      export CODEX_HOOK_BLOCK_FILE
+      rm -f "$CODEX_HOOK_BLOCK_FILE" 2>/dev/null || true
+    else
+      log_warn "Hooks enabled but codex-hook-runner not found; running without hooks"
+    fi
+  else
+    export CODEX_HOOKS=0
+  fi
+
+  if [[ "$use_hooks" == "true" ]]; then
+    if [[ "$mode" == "new" ]]; then
+      "$hook_runner" --project-root "$worktree_dir" --hook-root "$hook_root" --hooks "$hook_config" --transcript "$hook_transcript" \
+        exec "${flags[@]}" -C "$worktree_dir" "$prompt" || exit_code=$?
+    else
+      "$hook_runner" --project-root "$worktree_dir" --hook-root "$hook_root" --hooks "$hook_config" --transcript "$hook_transcript" \
+        resume "$codex_session_id" -C "$worktree_dir" "$prompt" || exit_code=$?
+    fi
+  else
+    if [[ "$mode" == "new" ]]; then
+      codex "${flags[@]}" -C "$worktree_dir" "$prompt" || exit_code=$?
+    else
+      codex "${flags[@]}" resume "$codex_session_id" -C "$worktree_dir" "$prompt" || exit_code=$?
+    fi
+  fi
+
+  local discovered=""
+  if [[ -z "$codex_session_id" ]]; then
+    discovered=$(discover_new_session_id "$before_lines" || true)
+  fi
+
+  echo "${exit_code}|${discovered}"
+}
+
+# Ignore signals in parent so Codex gets them; restart loop handles exits.
+trap '' SIGTERM SIGINT
+
+REPO_PATH=""
+EPIC=""
+NEW_MODE=false
+CONTINUE_MODE=false
+RESUME_ID=""
+LIST_MODE=false
+
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+    -e|--epic)
+      [[ -n "${2:-}" && "${2:-}" != -* ]] || die "--epic requires a value"
+      EPIC="$2"
+      shift 2
+      ;;
+    -n|--new)
+      NEW_MODE=true
+      shift
+      ;;
+    -c|--continue)
+      CONTINUE_MODE=true
+      shift
+      ;;
+    --resume)
+      if [[ -n "${2:-}" && "${2:-}" != -* ]]; then
+        RESUME_ID="$2"
+        shift 2
+      else
+        RESUME_ID="INTERACTIVE"
+        shift
+      fi
+      ;;
+    -l|--list)
+      LIST_MODE=true
+      shift
+      ;;
+    -r|--repo)
+      [[ -n "${2:-}" && "${2:-}" != -* ]] || die "--repo requires a path"
+      REPO_PATH="$2"
+      shift 2
+      ;;
+    -v|--version)
+      echo "codex-autonomous version ${VERSION}"
+      exit 0
+      ;;
+    -h|--help)
+      head -n 40 "$0" | grep -E "^#" | sed 's/^# *//'
+      exit 0
+      ;;
+    *)
+      die "Unknown option: $1 (use --help)"
+      ;;
+  esac
+done
+
+EPIC="${EPIC:-${WORK_EPIC:-}}"
+
+check_tool "git" "Install git via your package manager"
+check_tool "gh" "Install GitHub CLI: https://cli.github.com/"
+check_tool "jq" "Install jq via your package manager"
+check_tool "codex" "Install Codex CLI: pnpm add -g @openai/codex"
+
+if [[ "$LIST_MODE" == "true" ]]; then
+  list_sessions
+  exit 0
+fi
+
+ensure_session_log
+
+# Handle --continue / --resume
+if [[ "$CONTINUE_MODE" == "true" || -n "$RESUME_ID" ]]; then
+  if [[ "$CONTINUE_MODE" == "true" ]]; then
+    line=$(get_latest_session_line || true)
+    [[ -n "$line" ]] || die "No recorded sessions. Start one with: codex-autonomous"
+  else
+    if [[ "$RESUME_ID" == "INTERACTIVE" ]]; then
+      list_sessions
+      echo ""
+      read -r -p "Enter worktree id or codex session id to resume: " picked
+      [[ -n "$picked" ]] || die "No selection"
+      RESUME_ID="$picked"
+    fi
+
+    line=$(get_session_info_by_id "$RESUME_ID" || true)
+    if [[ -z "$line" ]]; then
+      # Try lookup by Codex session id (3rd field)
+      line=$(awk -v sid="$RESUME_ID" '$3==sid {print}' "$SESSION_LOG" | tail -n 1 || true)
+    fi
+    [[ -n "$line" ]] || die "Session not found in $SESSION_LOG: $RESUME_ID"
+  fi
+
+  WORKTREE_ID=$(echo "$line" | awk '{print $2}')
+  CODEX_SESSION_ID=$(echo "$line" | awk '{print $3}')
+  REPO_NAME=$(echo "$line" | awk '{print $4}')
+  WORKTREE_DIR=$(echo "$line" | awk '{print $5}')
+  export CODEX_AUTONOMOUS_SESSION_ID="${WORKTREE_ID}"
+
+  log_info "Resuming worktree ${WORKTREE_ID} (Codex session: ${CODEX_SESSION_ID})"
+
+  if [[ ! -d "$WORKTREE_DIR" ]]; then
+    log_warn "Worktree missing. Recreating at: $WORKTREE_DIR"
+    REPO_ROOT=$(git rev-parse --show-toplevel 2>/dev/null || true)
+    [[ -n "$REPO_ROOT" ]] || die "Run resume from within a git repo to recreate the worktree"
+    DEFAULT_BRANCH=$(parse_default_branch)
+    mkdir -p "$(dirname "$WORKTREE_DIR")"
+    git worktree prune >/dev/null 2>&1 || true
+    git fetch origin "$DEFAULT_BRANCH" >/dev/null 2>&1 || true
+    git worktree add "$WORKTREE_DIR" "origin/${DEFAULT_BRANCH}" >/dev/null
+  fi
+
+  cd "$WORKTREE_DIR"
+  ensure_github_token
+
+  CRASHES=0
+  ACCOUNT_SWITCHES=0
+  MSG=""
+  while true; do
+    before_lines=$(count_lines "$HISTORY_FILE")
+    result=$(run_codex_session "resume" "$WORKTREE_DIR" "$MSG" "$CODEX_SESSION_ID" "$before_lines")
+    EXIT_CODE="${result%%|*}"
+
+    if [[ "$EXIT_CODE" -eq 0 ]]; then
+      log_ok "Session completed successfully"
+      exit 0
+    fi
+
+    if [[ "${HOOKS_ACTIVE}" == "true" && "$EXIT_CODE" -eq 2 ]]; then
+      if [[ -f "${CODEX_HOOK_BLOCK_FILE:-}" ]]; then
+        MSG=$(cat "$CODEX_HOOK_BLOCK_FILE" 2>/dev/null || echo "")
+        rm -f "$CODEX_HOOK_BLOCK_FILE" 2>/dev/null || true
+      fi
+      [[ -n "$MSG" ]] || MSG="Hook blocked execution. Address the gate and continue."
+      continue
+    fi
+
+    if [[ "${HOOKS_ACTIVE}" == "true" ]]; then
+      if hook_msg=$(handle_hook_account_state "${CODEX_AUTONOMOUS_SESSION_ID:-$WORKTREE_ID}"); then
+        MSG="$hook_msg"
+        ACCOUNT_SWITCHES=0
+        continue
+      fi
+    fi
+
+    CRASHES=$((CRASHES + 1))
+    log_warn "Codex exited with code ${EXIT_CODE} (crash ${CRASHES}/${MAX_CRASHES})"
+    if (( CRASHES >= MAX_CRASHES )); then
+      die "Maximum crash limit reached"
+    fi
+
+    transcript=$(find_session_file "$CODEX_SESSION_ID" || true)
+    if [[ -n "$transcript" ]] && detect_plan_limit_in_transcript "$transcript"; then
+      log_warn "Possible plan/rate limit detected"
+      switched_to=""
+      if switched_to=$(try_switch_account); then
+        ACCOUNT_SWITCHES=$((ACCOUNT_SWITCHES + 1))
+        if (( ACCOUNT_SWITCHES >= MAX_ACCOUNT_SWITCHES )); then
+          die "Maximum account switches (${MAX_ACCOUNT_SWITCHES}) reached"
+        fi
+        MSG="Account switched to ${switched_to}. Resume work without repeating the failing request."
+        log_ok "Switched account → ${switched_to}"
+        continue
+      elif [[ "$?" -eq 2 ]]; then
+        wait_for_account_cooldown
+        MSG="All accounts were exhausted. Cooldown complete; resume work carefully."
+        ACCOUNT_SWITCHES=0
+        continue
+      fi
+    fi
+
+    MSG="You exited unexpectedly (code ${EXIT_CODE}). Diagnose the failure and continue. Do NOT repeat the same action if it caused a crash."
+    sleep 2
+  done
+fi
+
+# If repo path provided, cd into it
+if [[ -n "$REPO_PATH" ]]; then
+  cd "$REPO_PATH"
+fi
+
+# Validate repo
+git rev-parse --show-toplevel >/dev/null 2>&1 || die "Not in a git repository (use --repo <path>)"
+gh auth status >/dev/null 2>&1 || die "GitHub CLI not authenticated. Run: gh auth login"
+
+ensure_github_token
+
+# Validate epic (if specified)
+ISSUE_TITLE=""
+if [[ -n "$EPIC" ]]; then
+  log_info "Validating Epic #${EPIC}..."
+  ISSUE_JSON=$(gh issue view "$EPIC" --json state,title,url 2>/dev/null) || die "Epic #${EPIC} not found"
+  ISSUE_STATE=$(echo "$ISSUE_JSON" | jq -r '.state')
+  ISSUE_TITLE=$(echo "$ISSUE_JSON" | jq -r '.title')
+  ISSUE_URL=$(echo "$ISSUE_JSON" | jq -r '.url')
+  [[ "$ISSUE_STATE" == "OPEN" ]] || die "Epic #${EPIC} is ${ISSUE_STATE} (${ISSUE_URL})"
+  log_ok "Epic validated: ${ISSUE_TITLE}"
+fi
+
+REPO_ROOT=$(git rev-parse --show-toplevel)
+REPO_NAME=$(basename "$REPO_ROOT")
+DEFAULT_BRANCH=$(parse_default_branch)
+
+WORKTREE_ID=$(uuid)
+WORKTREE_DIR="${WORKTREE_ROOT}/${REPO_NAME}/${WORKTREE_ID}"
+export CODEX_AUTONOMOUS_SESSION_ID="${WORKTREE_ID}"
+
+git worktree prune >/dev/null 2>&1 || true
+mkdir -p "$WORKTREE_ROOT"
+chmod 700 "$WORKTREE_ROOT" 2>/dev/null || true
+
+log_info "Creating worktree at ${WORKTREE_DIR} from origin/${DEFAULT_BRANCH}..."
+mkdir -p "$(dirname "$WORKTREE_DIR")"
+git fetch origin "$DEFAULT_BRANCH" >/dev/null 2>&1 || true
+git worktree add "$WORKTREE_DIR" "origin/${DEFAULT_BRANCH}" >/dev/null
+
+details="scope=all"
+if [[ -n "$EPIC" ]]; then
+  details="epic=#${EPIC}"
+fi
+
+CODEX_SESSION_ID=""
+before_lines=$(count_lines "$HISTORY_FILE")
+
+echo -e "${CYAN}╔══════════════════════════════════════════════════════════════╗${NC}"
+echo -e "${CYAN}║${NC}           ${GREEN}Codex Autonomous Issue-Driven Development${NC}           ${CYAN}║${NC}"
+echo -e "${CYAN}╚══════════════════════════════════════════════════════════════╝${NC}"
+echo ""
+echo -e "${BLUE}Worktree ID:${NC}  ${WORKTREE_ID}"
+echo -e "${BLUE}Repository:${NC}   ${REPO_NAME}"
+echo -e "${BLUE}Branch:${NC}       ${DEFAULT_BRANCH}"
+echo -e "${BLUE}Worktree:${NC}     ${WORKTREE_DIR}"
+if [[ -n "$EPIC" ]]; then
+  echo -e "${BLUE}Focus Epic:${NC}   #${EPIC} - ${ISSUE_TITLE}"
+fi
+echo ""
+
+cd "$WORKTREE_DIR"
+
+if [[ "$NEW_MODE" == "true" ]]; then
+  INITIAL_PROMPT="You are working in an isolated git worktree at: ${WORKTREE_DIR}
+
+This worktree was created from origin/${DEFAULT_BRANCH} to allow autonomous work without affecting the main repository.
+
+ENVIRONMENT:
+- Isolated worktree from origin/${DEFAULT_BRANCH}
+- GitHub token configured for API access
+- Run tests/builds locally before PRs
+
+READY FOR INSTRUCTIONS:
+I am bootstrapped and ready. Please provide instructions."
+else
+  if [[ -n "$EPIC" ]]; then
+    EPIC_INSTRUCTION="Focus exclusively on Epic #${EPIC} and its child issues. Do not work on unrelated issues."
+  else
+    EPIC_INSTRUCTION="Work through all open epics and issues in priority order."
+  fi
+
+  INITIAL_PROMPT="You are working in an isolated git worktree at: ${WORKTREE_DIR}
+
+TASK: Use an issue-driven development workflow and work autonomously until all assigned work is complete.
+
+IMPORTANT:
+- Create feature branches and push to origin
+- Open PRs when work is complete (do not merge directly to ${DEFAULT_BRANCH})
+- Verify locally (tests/build) before creating PRs
+
+${EPIC_INSTRUCTION}"
+fi
+
+cleanup() {
+  local exit_code="$1"
+  if [[ "$exit_code" -eq 0 ]]; then
+    log_info "Cleaning up worktree..."
+    cd "$REPO_ROOT" 2>/dev/null || true
+    git worktree remove --force "$WORKTREE_DIR" >/dev/null 2>&1 || true
+    git worktree prune >/dev/null 2>&1 || true
+    log_ok "Session ended: ${WORKTREE_ID}"
+  else
+    log_warn "Session exited with code ${exit_code}. Preserving worktree for recovery."
+    echo -e "${BLUE}Worktree preserved at:${NC} ${WORKTREE_DIR}"
+    echo -e "${BLUE}Resume with:${NC} codex-autonomous --resume ${WORKTREE_ID}"
+  fi
+}
+
+CRASHES=0
+ACCOUNT_SWITCHES=0
+MSG=""
+FIRST_RUN=true
+
+log_ok "Starting autonomous operation..."
+echo ""
+
+while true; do
+  EXIT_CODE=0
+  discovered=""
+
+  if [[ "$FIRST_RUN" == "true" ]]; then
+    FIRST_RUN=false
+    result=$(run_codex_session "new" "$WORKTREE_DIR" "$INITIAL_PROMPT" "" "$before_lines")
+    EXIT_CODE="${result%%|*}"
+    discovered="${result##*|}"
+    CODEX_SESSION_ID="${discovered:-}"
+    [[ -n "$CODEX_SESSION_ID" ]] || CODEX_SESSION_ID=""
+
+    if [[ -n "$CODEX_SESSION_ID" ]]; then
+      echo "$(date -Iseconds) ${WORKTREE_ID} ${CODEX_SESSION_ID} ${REPO_NAME} ${WORKTREE_DIR} ${details}" >> "$SESSION_LOG"
+      chmod 600 "$SESSION_LOG" 2>/dev/null || true
+    else
+      log_warn "Could not discover Codex session id; resume will not be available from the log"
+    fi
+  else
+    result=$(run_codex_session "resume" "$WORKTREE_DIR" "$MSG" "$CODEX_SESSION_ID" "$(count_lines "$HISTORY_FILE")")
+    EXIT_CODE="${result%%|*}"
+  fi
+
+  if [[ "$EXIT_CODE" -eq 0 ]]; then
+    cleanup 0
+    exit 0
+  fi
+
+  if [[ "${HOOKS_ACTIVE}" == "true" && "$EXIT_CODE" -eq 2 ]]; then
+    if [[ -f "${CODEX_HOOK_BLOCK_FILE:-}" ]]; then
+      MSG=$(cat "$CODEX_HOOK_BLOCK_FILE" 2>/dev/null || echo "")
+      rm -f "$CODEX_HOOK_BLOCK_FILE" 2>/dev/null || true
+    fi
+    [[ -n "$MSG" ]] || MSG="Hook blocked execution. Address the gate and continue."
+    continue
+  fi
+
+  if [[ "${HOOKS_ACTIVE}" == "true" ]]; then
+    if hook_msg=$(handle_hook_account_state "${CODEX_AUTONOMOUS_SESSION_ID:-$WORKTREE_ID}"); then
+      MSG="$hook_msg"
+      ACCOUNT_SWITCHES=0
+      continue
+    fi
+  fi
+
+CRASHES=$((CRASHES + 1))
+log_warn "Codex exited with code ${EXIT_CODE} (crash ${CRASHES}/${MAX_CRASHES})"
+if (( CRASHES >= MAX_CRASHES )); then
+  cleanup "$EXIT_CODE"
+  die "Maximum crash limit reached"
+fi
+
+# Account switching on plan/rate limit detection
+if [[ -n "$CODEX_SESSION_ID" ]]; then
+  transcript=$(find_session_file "$CODEX_SESSION_ID" || true)
+  if [[ -n "$transcript" ]] && detect_plan_limit_in_transcript "$transcript"; then
+    log_warn "Possible plan/rate limit detected"
+    switched_to=""
+    if switched_to=$(try_switch_account); then
+      ACCOUNT_SWITCHES=$((ACCOUNT_SWITCHES + 1))
+      if (( ACCOUNT_SWITCHES >= MAX_ACCOUNT_SWITCHES )); then
+        cleanup "$EXIT_CODE"
+        die "Maximum account switches (${MAX_ACCOUNT_SWITCHES}) reached"
+      fi
+      MSG="Account switched to ${switched_to}. Resume work without repeating the failing request."
+      log_ok "Switched account → ${switched_to}"
+      continue
+    elif [[ "$?" -eq 2 ]]; then
+      wait_for_account_cooldown
+      MSG="All accounts were exhausted. Cooldown complete; resume work carefully."
+      ACCOUNT_SWITCHES=0
+      continue
+    fi
+  fi
+fi
+
+MSG="You exited unexpectedly (code ${EXIT_CODE}). Diagnose the failure and continue. Do NOT repeat the same action if it caused a crash."
+sleep 2
+done
