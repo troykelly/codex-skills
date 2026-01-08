@@ -272,6 +272,91 @@ parse_response_action() {
   return 1
 }
 
+command_is_inspection() {
+  local cmd="$1"
+  [[ -n "$cmd" ]] || return 1
+  echo "$cmd" | grep -Eqi '(^|[[:space:]/"'"'"'`])(rg|grep|cat|sed|awk|head|tail|find|fd|tree|stat)([[:space:]]|$)|git[[:space:]]+(show|grep|diff)'
+}
+
+last_turn_has_inspection() {
+  local transcript="$1"
+  [[ -f "$transcript" ]] || return 1
+
+  while IFS= read -r line; do
+    [[ -z "$line" ]] && continue
+    if ! echo "$line" | jq -e . >/dev/null 2>&1; then
+      continue
+    fi
+
+    local event_type
+    event_type=$(echo "$line" | jq -r '.type // empty' 2>/dev/null || true)
+    if [[ "$event_type" == "turn.started" ]]; then
+      return 1
+    fi
+
+    if [[ "$event_type" == "item.started" || "$event_type" == "item.completed" ]]; then
+      local item_type
+      item_type=$(echo "$line" | jq -r '.item.type // empty' 2>/dev/null || true)
+      case "$item_type" in
+        command_execution)
+          local cmd
+          cmd=$(echo "$line" | jq -r '.item.command // empty' 2>/dev/null || true)
+          if command_is_inspection "$cmd"; then
+            return 0
+          fi
+          ;;
+        mcp_tool_call)
+          return 0
+          ;;
+      esac
+    fi
+  done < <(tac "$transcript")
+
+  return 1
+}
+
+question_has_evidence() {
+  local text="$1"
+  [[ -n "$text" ]] || return 1
+
+  if echo "$text" | grep -Eq '([A-Za-z0-9._/-]+\\.(md|ts|tsx|js|jsx|json|yml|yaml|toml|sh|py|go|rs|rb|java|kt|swift|c|cpp|h|hpp))'; then
+    return 0
+  fi
+
+  if echo "$text" | grep -Eiq '(README|FEATURES|BRANDING|AGENTS)\\.md|docs/|storybook'; then
+    return 0
+  fi
+
+  if echo "$text" | grep -Eiq '(after (checking|reviewing|reading|searching)|i (checked|reviewed|searched|looked)|could not find|couldn'"'"'t find|not found|no mention)'; then
+    return 0
+  fi
+
+  return 1
+}
+
+should_prompt_user() {
+  local transcript="$1"
+  local question="$2"
+
+  if ! last_turn_has_inspection "$transcript"; then
+    return 1
+  fi
+
+  if question_has_evidence "$question"; then
+    return 0
+  fi
+
+  return 1
+}
+
+question_gate_message() {
+  local reason="$1"
+  cat <<EOF
+Do not ask the user yet. ${reason}
+Inspect the repository and docs first (use rg/cat) and answer if possible. Only ask if the answer is still missing after search, and cite file evidence or explicitly state what could not be found.
+EOF
+}
+
 wrap_resume_prompt() {
   local base="${1:-}"
 
@@ -809,6 +894,14 @@ if [[ "$CONTINUE_MODE" == "true" || -n "$RESUME_ID" ]]; then
               continue
               ;;
             needs_user)
+              if ! last_turn_has_inspection "$RUN_TRANSCRIPT"; then
+                MSG=$(question_gate_message "Your last turn asked a question without inspecting the repository.")
+                continue
+              fi
+              if ! question_has_evidence "$LAST_QUESTION"; then
+                MSG=$(question_gate_message "Your question did not cite file evidence or state what was missing after search.")
+                continue
+              fi
               if [[ "${CODEX_AUTONOMOUS_INTERACTIVE:-true}" == "false" ]]; then
                 log_warn "Codex requested input; continuing autonomously (CODEX_AUTONOMOUS_INTERACTIVE=false)."
                 MSG="${CODEX_AUTONOMOUS_CONTINUE_PROMPT:-Continue autonomously.}"
@@ -827,18 +920,8 @@ if [[ "$CONTINUE_MODE" == "true" || -n "$RESUME_ID" ]]; then
         fi
       fi
 
-      log_warn "Codex response missing structured action; prompting for input."
-      if [[ "${CODEX_AUTONOMOUS_INTERACTIVE:-true}" == "false" ]]; then
-        MSG="${CODEX_AUTONOMOUS_CONTINUE_PROMPT:-Continue autonomously.}"
-        continue
-      fi
-      MSG=$(prompt_for_reply)
-      if [[ "$MSG" == "__CODEX_AUTONOMOUS_QUIT__" ]]; then
-        exit 0
-      fi
-      if [[ -z "$MSG" ]]; then
-        MSG="${CODEX_AUTONOMOUS_CONTINUE_PROMPT:-Continue autonomously.}"
-      fi
+      log_warn "Codex response missing structured action; enforcing response contract."
+      MSG=$(question_gate_message "Your response was not valid JSON in the required format.")
       continue
     fi
 
@@ -1082,6 +1165,14 @@ while true; do
               cleanup 1
               exit 1
             fi
+            if ! last_turn_has_inspection "$RUN_TRANSCRIPT"; then
+              MSG=$(question_gate_message "Your last turn asked a question without inspecting the repository.")
+              continue
+            fi
+            if ! question_has_evidence "$LAST_QUESTION"; then
+              MSG=$(question_gate_message "Your question did not cite file evidence or state what was missing after search.")
+              continue
+            fi
             if [[ "${CODEX_AUTONOMOUS_INTERACTIVE:-true}" == "false" ]]; then
               log_warn "Codex requested input; continuing autonomously (CODEX_AUTONOMOUS_INTERACTIVE=false)."
               MSG="${CODEX_AUTONOMOUS_CONTINUE_PROMPT:-Continue autonomously.}"
@@ -1101,24 +1192,13 @@ while true; do
       fi
     fi
 
-    log_warn "Codex response missing structured action; prompting for input."
+    log_warn "Codex response missing structured action; enforcing response contract."
     if [[ -z "$CODEX_SESSION_ID" ]]; then
       log_warn "Codex finished but no session id was recorded; ending session."
       cleanup 1
       exit 1
     fi
-    if [[ "${CODEX_AUTONOMOUS_INTERACTIVE:-true}" == "false" ]]; then
-      MSG="${CODEX_AUTONOMOUS_CONTINUE_PROMPT:-Continue autonomously.}"
-      continue
-    fi
-    MSG=$(prompt_for_reply)
-    if [[ "$MSG" == "__CODEX_AUTONOMOUS_QUIT__" ]]; then
-      cleanup 0
-      exit 0
-    fi
-    if [[ -z "$MSG" ]]; then
-      MSG="${CODEX_AUTONOMOUS_CONTINUE_PROMPT:-Continue autonomously.}"
-    fi
+    MSG=$(question_gate_message "Your response was not valid JSON in the required format.")
     continue
   fi
 

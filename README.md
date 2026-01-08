@@ -56,6 +56,7 @@ Notes:
 - Set `CODEX_NEW_PROMPT` to skip the interactive prompt (useful for scripts).
 - Codex replies use a structured response contract (`action`, `message`, `question`) so `codex-autonomous` knows when user input is required.
 - When `action=needs_user`, `codex-autonomous` prompts for a reply and resumes automatically.
+- Questions are gated: if a turn didn’t inspect the repo or the question lacks evidence/missing‑info context, `codex-autonomous` auto‑continues and instructs Codex to search first.
 - Disable prompting with `CODEX_AUTONOMOUS_INTERACTIVE=false` (it will auto-continue instead).
 - Customize the auto-continue message with `CODEX_AUTONOMOUS_CONTINUE_PROMPT`.
 - Override the response schema path with `CODEX_AUTONOMOUS_SCHEMA_FILE`.
