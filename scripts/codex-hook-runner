@@ -716,15 +716,16 @@ extract_tool_result_raw() {
     empty' 2>/dev/null
 }
 
-CODEX_PROC=()
-coproc CODEX_PROC { codex "${EXEC_ARGS[@]}"; }
-READ_FD="${CODEX_PROC[0]-}"
-if [[ -z "$READ_FD" ]]; then
-  die "Failed to start codex process"
-fi
-CODEX_PID=$!
+FIFO_PATH="$(mktemp -u "${TMPDIR:-/tmp}/codex-hook-runner.XXXXXX")"
+mkfifo "$FIFO_PATH"
+trap 'rm -f "$FIFO_PATH"' EXIT
 
-while IFS= read -r line <&"$READ_FD"; do
+codex "${EXEC_ARGS[@]}" > "$FIFO_PATH" &
+CODEX_PID=$!
+exec 3<"$FIFO_PATH"
+rm -f "$FIFO_PATH"
+
+while IFS= read -r line <&3; do
   [[ -z "$line" ]] && continue
   printf '%s\n' "$line" >> "$TRANSCRIPT_PATH" 2>/dev/null || true
 
