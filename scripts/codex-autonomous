@@ -81,8 +81,15 @@ die() { log_err "$*"; exit 1; }
 apply_epic_continue_default() {
   local epic="$1"
   if [[ -n "$epic" && -z "${CODEX_AUTONOMOUS_CONTINUE_PROMPT:-}" ]]; then
-    CODEX_AUTONOMOUS_CONTINUE_PROMPT="Continue autonomously on Epic #${epic}. Do not ask for user input; pick the next Ready child issue and proceed. If blocked, document it and move on."
+    CODEX_AUTONOMOUS_CONTINUE_PROMPT="Continue autonomously on Epic #${epic}. Do not run session-start/work-intake or read AGENTS.md/SKILL.md unless explicitly asked. Pick the next Ready child issue and proceed. If blocked, document it and move on."
   fi
+}
+
+epic_fast_start_enabled() {
+  case "${CODEX_AUTONOMOUS_EPIC_FAST_START:-true}" in
+    0|false|no) return 1 ;;
+  esac
+  return 0
 }
 
 apply_epic_interactive_default() {
@@ -1096,6 +1103,9 @@ ${RESPONSE_CONTRACT}"
 else
 if [[ -n "$EPIC" ]]; then
   EPIC_INSTRUCTION="Focus exclusively on Epic #${EPIC} and its child issues. Do not work on unrelated issues. Avoid broad repo/skill scans; read the epic and immediate child issues, then start implementation."
+  if epic_fast_start_enabled; then
+    EPIC_INSTRUCTION="${EPIC_INSTRUCTION} Fast start: skip session-start/work-intake and avoid reading AGENTS.md or SKILL.md unless explicitly requested. Immediately fetch the epic + child issues via gh, pick the next Ready child issue, and begin implementation."
+  fi
 else
   EPIC_INSTRUCTION="Work through all open epics and issues in priority order."
 fi
