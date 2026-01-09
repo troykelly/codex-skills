@@ -6,7 +6,7 @@
 #   codex-autonomous [OPTIONS]
 #
 # Options:
-#   -e, --epic <N>       Focus on a specific epic/issue number
+#   -e, --epic <N>       Focus on a specific epic/issue number (auto-continue prompts by default)
 #   -n, --new            Bootstrap worktree, then prompt for instructions
 #   -c, --continue       Resume the most recent autonomous session
 #   --resume [ID]        Resume a session (worktree id or Codex session UUID). If omitted, shows list
@@ -77,6 +77,22 @@ log_warn() { echo -e "${YELLOW}[WARN]${NC} $*"; }
 log_err() { echo -e "${RED}[ERROR]${NC} $*"; }
 
 die() { log_err "$*"; exit 1; }
+
+apply_epic_continue_default() {
+  local epic="$1"
+  if [[ -n "$epic" && -z "${CODEX_AUTONOMOUS_CONTINUE_PROMPT:-}" ]]; then
+    CODEX_AUTONOMOUS_CONTINUE_PROMPT="Continue autonomously on Epic #${epic}. Do not ask for user input; pick the next Ready child issue and proceed. If blocked, document it and move on."
+  fi
+}
+
+apply_epic_interactive_default() {
+  local epic="$1"
+  if [[ -n "$epic" && -z "${CODEX_AUTONOMOUS_INTERACTIVE:-}" ]]; then
+    CODEX_AUTONOMOUS_INTERACTIVE="false"
+    log_info "Epic mode: disabling interactive prompts (set CODEX_AUTONOMOUS_INTERACTIVE=true to override)."
+  fi
+  apply_epic_continue_default "$epic"
+}
 
 check_tool() {
   local cmd="$1"
@@ -816,6 +832,7 @@ while [[ $# -gt 0 ]]; do
 done
 
 EPIC="${EPIC:-${WORK_EPIC:-}}"
+apply_epic_interactive_default "$EPIC"
 
 check_tool "git" "Install git via your package manager"
 check_tool "gh" "Install GitHub CLI: https://cli.github.com/"
@@ -855,6 +872,11 @@ if [[ "$CONTINUE_MODE" == "true" || -n "$RESUME_ID" ]]; then
   CODEX_SESSION_ID=$(echo "$line" | awk '{print $3}')
   REPO_NAME=$(echo "$line" | awk '{print $4}')
   WORKTREE_DIR=$(echo "$line" | awk '{print $5}')
+  DETAILS=$(echo "$line" | awk '{print $6}')
+  if [[ "$DETAILS" == epic=#* ]]; then
+    RESUME_EPIC="${DETAILS#epic=#}"
+    apply_epic_interactive_default "$RESUME_EPIC"
+  fi
   export CODEX_AUTONOMOUS_SESSION_ID="${WORKTREE_ID}"
 
   log_info "Resuming worktree ${WORKTREE_ID} (Codex session: ${CODEX_SESSION_ID})"
@@ -894,17 +916,17 @@ if [[ "$CONTINUE_MODE" == "true" || -n "$RESUME_ID" ]]; then
               continue
               ;;
             needs_user)
+              if [[ "${CODEX_AUTONOMOUS_INTERACTIVE:-true}" == "false" ]]; then
+                log_warn "Codex requested input; continuing autonomously (CODEX_AUTONOMOUS_INTERACTIVE=false)."
+                MSG="${CODEX_AUTONOMOUS_CONTINUE_PROMPT:-Continue autonomously.}"
+                continue
+              fi
               if ! last_turn_has_inspection "$RUN_TRANSCRIPT"; then
                 MSG=$(question_gate_message "Your last turn asked a question without inspecting the repository.")
                 continue
               fi
               if ! question_has_evidence "$LAST_QUESTION"; then
                 MSG=$(question_gate_message "Your question did not cite file evidence or state what was missing after search.")
-                continue
-              fi
-              if [[ "${CODEX_AUTONOMOUS_INTERACTIVE:-true}" == "false" ]]; then
-                log_warn "Codex requested input; continuing autonomously (CODEX_AUTONOMOUS_INTERACTIVE=false)."
-                MSG="${CODEX_AUTONOMOUS_CONTINUE_PROMPT:-Continue autonomously.}"
                 continue
               fi
               MSG=$(prompt_for_reply "$LAST_QUESTION")
@@ -1072,11 +1094,11 @@ ${USER_PROMPT}
 
 ${RESPONSE_CONTRACT}"
 else
-  if [[ -n "$EPIC" ]]; then
-    EPIC_INSTRUCTION="Focus exclusively on Epic #${EPIC} and its child issues. Do not work on unrelated issues."
-  else
-    EPIC_INSTRUCTION="Work through all open epics and issues in priority order."
-  fi
+if [[ -n "$EPIC" ]]; then
+  EPIC_INSTRUCTION="Focus exclusively on Epic #${EPIC} and its child issues. Do not work on unrelated issues. Avoid broad repo/skill scans; read the epic and immediate child issues, then start implementation."
+else
+  EPIC_INSTRUCTION="Work through all open epics and issues in priority order."
+fi
 
   INITIAL_PROMPT="You are working in an isolated git worktree at: ${WORKTREE_DIR}
 
@@ -1165,17 +1187,17 @@ while true; do
               cleanup 1
               exit 1
             fi
+            if [[ "${CODEX_AUTONOMOUS_INTERACTIVE:-true}" == "false" ]]; then
+              log_warn "Codex requested input; continuing autonomously (CODEX_AUTONOMOUS_INTERACTIVE=false)."
+              MSG="${CODEX_AUTONOMOUS_CONTINUE_PROMPT:-Continue autonomously.}"
+              continue
+            fi
             if ! last_turn_has_inspection "$RUN_TRANSCRIPT"; then
               MSG=$(question_gate_message "Your last turn asked a question without inspecting the repository.")
               continue
             fi
             if ! question_has_evidence "$LAST_QUESTION"; then
               MSG=$(question_gate_message "Your question did not cite file evidence or state what was missing after search.")
-              continue
-            fi
-            if [[ "${CODEX_AUTONOMOUS_INTERACTIVE:-true}" == "false" ]]; then
-              log_warn "Codex requested input; continuing autonomously (CODEX_AUTONOMOUS_INTERACTIVE=false)."
-              MSG="${CODEX_AUTONOMOUS_CONTINUE_PROMPT:-Continue autonomously.}"
               continue
             fi
             MSG=$(prompt_for_reply "$LAST_QUESTION")
