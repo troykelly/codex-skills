@@ -61,6 +61,7 @@ Notes:
 - When using `--epic`, prompting is disabled by default; set `CODEX_AUTONOMOUS_INTERACTIVE=true` to override.
 - With `CODEX_AUTONOMOUS_INTERACTIVE=false`, `needs_user` responses auto-continue without the question gate; use `CODEX_AUTONOMOUS_CONTINUE_PROMPT` to steer the agent forward.
 - Epic runs use a fast-start path by default (skip session-start/work-intake and avoid AGENTS/skills scans); set `CODEX_AUTONOMOUS_EPIC_FAST_START=false` to restore the full startup flow.
+- Fast-start replaces the default task line with a short step list so Codex starts with the epic and child issues immediately.
 - Customize the auto-continue message with `CODEX_AUTONOMOUS_CONTINUE_PROMPT`.
 - Override the response schema path with `CODEX_AUTONOMOUS_SCHEMA_FILE`.
 
