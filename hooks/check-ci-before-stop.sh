@@ -17,6 +17,11 @@ if [ -f "${SCRIPT_DIR}/lib/log-event.sh" ]; then
   # shellcheck disable=SC1091
   source "${SCRIPT_DIR}/lib/log-event.sh"
 fi
+# shellcheck source=lib/github-state.sh
+if [ -f "${SCRIPT_DIR}/lib/github-state.sh" ]; then
+  # shellcheck disable=SC1091
+  source "${SCRIPT_DIR}/lib/github-state.sh"
+fi
 
 log_hook_event "Stop" "check-ci-before-stop" "started" "{}"
 
@@ -33,7 +38,7 @@ if ! command -v gh &>/dev/null; then
 fi
 
 # Get repository info
-REPO=$(gh repo view --json nameWithOwner --jq '.nameWithOwner' 2>/dev/null || echo "")
+REPO=$(get_repo)
 if [ -z "${REPO}" ]; then
   log_hook_event "Stop" "check-ci-before-stop" "skipped" '{"reason": "not a github repo"}'
   exit 0
@@ -44,13 +49,11 @@ CURRENT_USER=$(gh api user --jq '.login' 2>/dev/null || echo "")
 
 # Check for ALL open PRs in the repo (not just current branch)
 # This catches PRs created during this session from any feature branch
-if [ -n "${CURRENT_USER}" ]; then
-  # Filter to PRs authored by current user
-  OPEN_PRS=$(gh pr list --author "${CURRENT_USER}" --state open --json number,title,headRefName 2>/dev/null || echo "[]")
-else
-  # Fallback to all open PRs if we can't determine user
-  OPEN_PRS=$(gh pr list --state open --json number,title,headRefName 2>/dev/null || echo "[]")
-fi
+OPEN_PRS=$(gh api --paginate "/repos/${REPO}/pulls?state=open&per_page=100" \
+  --jq '.[]' 2>/dev/null | \
+  jq -s --arg current "${CURRENT_USER}" \
+    'map(select($current == "" or .user.login == $current)) |
+     map({number, title, headRefName: .head.ref})' 2>/dev/null || echo "[]")
 PR_COUNT=$(echo "${OPEN_PRS}" | jq 'length')
 
 if [ "${PR_COUNT}" = "0" ]; then
@@ -75,7 +78,7 @@ format_pr_list() {
 
 while IFS= read -r pr_num; do
   [[ -n "${pr_num}" ]] || continue
-  CHECKS_JSON=$(gh pr checks "${pr_num}" --json name,state,conclusion 2>/dev/null || echo "[]")
+  CHECKS_JSON=$(get_pr_checks_json "${REPO}" "${pr_num}" 2>/dev/null || echo "[]")
 
   if [ "${CHECKS_JSON}" = "[]" ]; then
     continue

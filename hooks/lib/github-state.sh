@@ -41,9 +41,61 @@ get_repo() {
     echo "$GITHUB_REPO"
     return 0
   fi
+  if [ -n "${GITHUB_REPOSITORY:-}" ]; then
+    echo "$GITHUB_REPOSITORY"
+    return 0
+  fi
+  if [ -n "${GH_REPO:-}" ]; then
+    echo "$GH_REPO"
+    return 0
+  fi
+  if [ -n "${CODEX_REPO_CACHE:-}" ]; then
+    echo "$CODEX_REPO_CACHE"
+    return 0
+  fi
+
+  local remote repo
+  remote=$(git remote get-url origin 2>/dev/null || git config --get remote.origin.url 2>/dev/null || echo "")
+  repo=""
+
+  case "$remote" in
+    git@*:* )
+      repo="${remote#*:}"
+      ;;
+    ssh://git@*/* )
+      repo="${remote#ssh://git@*/}"
+      ;;
+    https://*/* )
+      repo="${remote#https://*/}"
+      ;;
+    http://*/* )
+      repo="${remote#http://*/}"
+      ;;
+    git://*/* )
+      repo="${remote#git://*/}"
+      ;;
+  esac
+
+  repo="${repo%.git}"
+  if [[ "$repo" == [0-9]*/* ]]; then
+    repo="${repo#*/}"
+  fi
+
+  if [ -n "$repo" ] && [[ "$repo" == */* ]]; then
+    CODEX_REPO_CACHE="$repo"
+    export CODEX_REPO_CACHE
+    echo "$repo"
+    return 0
+  fi
 
   if command -v gh &>/dev/null; then
-    gh repo view --json nameWithOwner --jq '.nameWithOwner' 2>/dev/null || echo ""
+    repo=$(gh repo view --json nameWithOwner --jq '.nameWithOwner' 2>/dev/null || echo "")
+    if [ -n "$repo" ]; then
+      CODEX_REPO_CACHE="$repo"
+      export CODEX_REPO_CACHE
+      echo "$repo"
+      return 0
+    fi
   fi
 }
 
@@ -54,6 +106,116 @@ get_owner_repo() {
   if [ -n "$repo" ]; then
     echo "$repo" | tr '/' ' '
   fi
+}
+
+# Get PR check summary via REST (avoids GraphQL usage in gh cli commands).
+# Arguments:
+#   $1 - owner/repo
+#   $2 - PR number
+get_pr_checks_json() {
+  local repo="${1:-}"
+  local pr_number="${2:-}"
+
+  if [ -z "$repo" ] || [ -z "$pr_number" ]; then
+    echo "[]"
+    return 0
+  fi
+
+  local pr_json sha
+  pr_json=$(gh api "/repos/$repo/pulls/$pr_number" 2>/dev/null || echo "")
+  sha=$(echo "$pr_json" | jq -r '.head.sha // empty' 2>/dev/null || echo "")
+
+  if [ -z "$sha" ]; then
+    echo "[]"
+    return 0
+  fi
+
+  local check_runs statuses
+  check_runs=$(gh api "/repos/$repo/commits/$sha/check-runs" \
+    -H "Accept: application/vnd.github+json" \
+    --jq '.check_runs // []' 2>/dev/null || echo "[]")
+  statuses=$(gh api "/repos/$repo/commits/$sha/status" \
+    --jq '.statuses // []' 2>/dev/null || echo "[]")
+
+  jq -cn \
+    --argjson check_runs "$check_runs" \
+    --argjson statuses "$statuses" \
+    '($check_runs // [] | map({
+      name: .name,
+      state: (if .status == "completed" then "COMPLETED" else "PENDING" end),
+      conclusion: (if .status != "completed" then "PENDING"
+                   elif .conclusion == "success" then "SUCCESS"
+                   else "FAILURE" end)
+    })) + ($statuses // [] | map({
+      name: .context,
+      state: (if .state == "pending" then "PENDING" else "COMPLETED" end),
+      conclusion: (if .state == "pending" then "PENDING"
+                   elif .state == "success" then "SUCCESS"
+                   else "FAILURE" end)
+    }))' || echo "[]"
+}
+
+# Check GitHub API rate limits via REST.
+# Arguments:
+#   $1 - GraphQL remaining minimum (optional, default: GITHUB_GRAPHQL_MIN_REMAINING or 100)
+#   $2 - REST remaining minimum (optional, default: GITHUB_REST_MIN_REMAINING or 100)
+# Returns:
+#   0 if limits are above thresholds, 1 otherwise
+check_rate_limits() {
+  local graphql_min="${1:-${GITHUB_GRAPHQL_MIN_REMAINING:-100}}"
+  local rest_min="${2:-${GITHUB_REST_MIN_REMAINING:-100}}"
+
+  if ! command -v gh &>/dev/null; then
+    echo "GitHub rate limit check skipped: gh not available"
+    return 1
+  fi
+
+  local rate_json
+  rate_json=$(gh api rate_limit 2>/dev/null || echo "")
+  if [ -z "$rate_json" ] || [ "$rate_json" = "null" ]; then
+    echo "GitHub rate limit check unavailable"
+    return 1
+  fi
+
+  local graphql_remaining graphql_limit graphql_reset
+  local rest_remaining rest_limit rest_reset
+  graphql_remaining=$(echo "$rate_json" | jq -r '.resources.graphql.remaining // 0')
+  graphql_limit=$(echo "$rate_json" | jq -r '.resources.graphql.limit // 0')
+  graphql_reset=$(echo "$rate_json" | jq -r '.resources.graphql.reset // 0')
+  rest_remaining=$(echo "$rate_json" | jq -r '.resources.core.remaining // 0')
+  rest_limit=$(echo "$rate_json" | jq -r '.resources.core.limit // 0')
+  rest_reset=$(echo "$rate_json" | jq -r '.resources.core.reset // 0')
+
+  echo "GitHub API rate limits: GraphQL ${graphql_remaining}/${graphql_limit}, REST ${rest_remaining}/${rest_limit}"
+
+  local ok=true
+  local now wait_seconds
+  now=$(date -u +%s)
+
+  if [ "$graphql_remaining" -lt "$graphql_min" ]; then
+    ok=false
+    wait_seconds=$((graphql_reset - now))
+    if [ "$wait_seconds" -gt 0 ]; then
+      echo "GraphQL remaining below ${graphql_min}; resets in ${wait_seconds}s"
+    else
+      echo "GraphQL remaining below ${graphql_min}; reset time unknown"
+    fi
+  fi
+
+  if [ "$rest_remaining" -lt "$rest_min" ]; then
+    ok=false
+    wait_seconds=$((rest_reset - now))
+    if [ "$wait_seconds" -gt 0 ]; then
+      echo "REST remaining below ${rest_min}; resets in ${wait_seconds}s"
+    else
+      echo "REST remaining below ${rest_min}; reset time unknown"
+    fi
+  fi
+
+  if [ "$ok" = "true" ]; then
+    return 0
+  fi
+  return 1
 }
 
 # Extract JSON from a structured comment block

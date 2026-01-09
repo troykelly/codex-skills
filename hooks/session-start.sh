@@ -11,6 +11,11 @@ if [ -f "${SCRIPT_DIR}/lib/log-event.sh" ]; then
   # shellcheck disable=SC1091
   source "${SCRIPT_DIR}/lib/log-event.sh"
 fi
+# shellcheck source=lib/github-state.sh
+if [ -f "${SCRIPT_DIR}/lib/github-state.sh" ]; then
+  # shellcheck disable=SC1091
+  source "${SCRIPT_DIR}/lib/github-state.sh"
+fi
 
 # Colors
 RED='\033[0;31m'
@@ -67,8 +72,10 @@ check_optional "uvx" || true
 # Check gh authentication
 echo ""
 echo "Checking GitHub CLI authentication..."
+GH_AUTH_OK=false
 if command -v gh &> /dev/null; then
     if gh auth status &> /dev/null; then
+        GH_AUTH_OK=true
         echo -e "  ${GREEN}✓${NC} GitHub CLI authenticated"
     else
         ERRORS+=("GitHub CLI not authenticated - run 'gh auth login'")
@@ -94,6 +101,17 @@ elif [ -n "${GITHUB_TOKEN:-}" ]; then
 else
     WARNINGS+=("GitHub token not set - required for GitHub MCP server")
     echo -e "  ${YELLOW}!${NC} GITHUB_PERSONAL_ACCESS_TOKEN/GITHUB_TOKEN not set"
+fi
+
+# Check GitHub API rate limits (REST)
+echo ""
+echo "Checking GitHub API rate limits..."
+if [ "${GH_AUTH_OK}" = "true" ] && declare -f check_rate_limits >/dev/null; then
+    if ! check_rate_limits; then
+        WARNINGS+=("GitHub API rate limits low - consider waiting or using REST operations")
+    fi
+else
+    echo -e "  ${YELLOW}!${NC} Skipping rate limit check (gh not authenticated)"
 fi
 
 # Check Codex account status (multi-account support)

@@ -14,6 +14,11 @@ if [ -f "${SCRIPT_DIR}/lib/log-event.sh" ]; then
   # shellcheck disable=SC1091
   source "${SCRIPT_DIR}/lib/log-event.sh"
 fi
+# shellcheck source=lib/github-state.sh
+if [ -f "${SCRIPT_DIR}/lib/github-state.sh" ]; then
+  # shellcheck disable=SC1091
+  source "${SCRIPT_DIR}/lib/github-state.sh"
+fi
 
 INPUT=$(cat)
 
@@ -36,17 +41,23 @@ if [ -z "${PR_NUM}" ]; then
   exit 0  # Can't determine PR, allow and let gh handle it
 fi
 
+REPO=$(get_repo)
+if [ -z "${REPO}" ]; then
+  exit 0  # Can't determine repo, allow and let gh handle it
+fi
+
 # Get PR details
-PR_DATA=$(gh pr view "${PR_NUM}" --json state,mergeable,reviewDecision,statusCheckRollup 2>/dev/null || echo "{}")
+PR_DATA=$(gh api "/repos/${REPO}/pulls/${PR_NUM}" 2>/dev/null || echo "{}")
 
 if [ "${PR_DATA}" = "{}" ]; then
   exit 0  # Can't get PR data, allow and let gh handle it
 fi
 
 # Check mergeable status
-MERGEABLE=$(echo "${PR_DATA}" | jq -r '.mergeable // "UNKNOWN"')
+MERGEABLE=$(echo "${PR_DATA}" | jq -r '.mergeable // empty')
+MERGEABLE_STATE=$(echo "${PR_DATA}" | jq -r '.mergeable_state // empty')
 
-if [ "${MERGEABLE}" = "CONFLICTING" ]; then
+if [ "${MERGEABLE}" = "false" ] || [ "${MERGEABLE_STATE}" = "dirty" ]; then
   log_hook_event "PreToolUse" "validate-pr-merge" "blocked" \
     "{\"pr\": ${PR_NUM}, \"reason\": \"conflicts\"}"
   cat >&2 <<EOF
@@ -64,8 +75,9 @@ EOF
 fi
 
 # Check CI status - get failed or pending checks
-FAILED_CHECKS=$(echo "${PR_DATA}" | jq -r '.statusCheckRollup // [] | map(select(.conclusion == "FAILURE")) | length')
-PENDING_CHECKS=$(echo "${PR_DATA}" | jq -r '.statusCheckRollup // [] | map(select(.status == "IN_PROGRESS" or .status == "QUEUED" or .status == "PENDING")) | length')
+CHECKS_JSON=$(get_pr_checks_json "${REPO}" "${PR_NUM}" 2>/dev/null || echo "[]")
+FAILED_CHECKS=$(echo "${CHECKS_JSON}" | jq -r '[.[] | select(.conclusion == "FAILURE")] | length')
+PENDING_CHECKS=$(echo "${CHECKS_JSON}" | jq -r '[.[] | select(.state == "PENDING")] | length')
 
 if [ "${FAILED_CHECKS}" != "0" ] && [ -n "${FAILED_CHECKS}" ]; then
   log_hook_event "PreToolUse" "validate-pr-merge" "blocked" \

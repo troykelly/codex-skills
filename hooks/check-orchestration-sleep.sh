@@ -43,12 +43,20 @@ log_hook_event "SessionStart" "check-orchestration-sleep" "started" "{}"
 # Get tracking issue from environment or project config
 TRACKING_ISSUE="${TRACKING_ISSUE:-${ORCHESTRATION_ISSUE:-}}"
 
+REPO=$(get_repo)
+if [ -n "${REPO}" ] && [ -z "${GITHUB_REPO:-}" ]; then
+  export GITHUB_REPO="${REPO}"
+fi
+
 # Try to find tracking issue from project if not set
 if [ -z "${TRACKING_ISSUE}" ]; then
   # Look for an open issue with "orchestration" label
-  REPO=$(get_repo)
   if [ -n "${REPO}" ]; then
-    TRACKING_ISSUE=$(gh issue list --repo "${REPO}" --label "orchestration" --state open --json number --jq '.[0].number // empty' 2>/dev/null || echo "")
+    TRACKING_ISSUE=$(gh api "/repos/${REPO}/issues" \
+      -f labels="orchestration" \
+      -f state="open" \
+      -f per_page=1 \
+      --jq '.[0].number // empty' 2>/dev/null || echo "")
   fi
 fi
 
@@ -131,7 +139,7 @@ add_status() {
 
 for PR in "${waiting_prs[@]}"; do
   # Check if all checks are complete (not pending)
-  CHECKS_JSON=$(gh pr checks "${PR}" --json name,state,conclusion 2>/dev/null || echo "[]")
+  CHECKS_JSON=$(get_pr_checks_json "${REPO}" "${PR}" 2>/dev/null || echo "[]")
 
   if [ "${CHECKS_JSON}" = "[]" ]; then
     echo -e "  PR #${PR}: ${YELLOW}No checks found${NC}"

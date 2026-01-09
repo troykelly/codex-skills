@@ -17,6 +17,11 @@ if [ -f "${SCRIPT_DIR}/lib/log-event.sh" ]; then
   # shellcheck disable=SC1091
   source "${SCRIPT_DIR}/lib/log-event.sh"
 fi
+# shellcheck source=lib/github-state.sh
+if [ -f "${SCRIPT_DIR}/lib/github-state.sh" ]; then
+  # shellcheck disable=SC1091
+  source "${SCRIPT_DIR}/lib/github-state.sh"
+fi
 
 INPUT=$(cat)
 
@@ -112,7 +117,7 @@ EOF
 fi
 
 # Get repository info
-REPO=$(gh repo view --json nameWithOwner --jq '.nameWithOwner' 2>/dev/null || echo "")
+REPO=$(get_repo)
 
 if [ -z "${REPO}" ]; then
   echo "WARNING: Could not determine repository - proceeding based on trust" >&2
