@@ -58,6 +58,8 @@ Notes:
 - When `action=needs_user`, `codex-autonomous` prompts for a reply and resumes automatically.
 - Questions are gated: if a turn didn’t inspect the repo or the question lacks evidence/missing‑info context, `codex-autonomous` auto‑continues and instructs Codex to search first.
 - Disable prompting with `CODEX_AUTONOMOUS_INTERACTIVE=false` (it will auto-continue instead).
+- When using `--epic`, prompting is disabled by default; set `CODEX_AUTONOMOUS_INTERACTIVE=true` to override.
+- With `CODEX_AUTONOMOUS_INTERACTIVE=false`, `needs_user` responses auto-continue without the question gate; use `CODEX_AUTONOMOUS_CONTINUE_PROMPT` to steer the agent forward.
 - Customize the auto-continue message with `CODEX_AUTONOMOUS_CONTINUE_PROMPT`.
 - Override the response schema path with `CODEX_AUTONOMOUS_SCHEMA_FILE`.
 
